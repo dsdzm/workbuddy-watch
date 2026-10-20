@@ -7,6 +7,10 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -263,6 +267,108 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         acpCall(session, ACP_RESOLVE_INTERRUPTION, params)
     }
 
+    // ---------- 积分用量 ----------
+
+    /**
+     * 拉取账号积分：资源包明细 + 今日请求次数。
+     *
+     * 端点取自 web 端「套餐与积分」页（`/profile/plans-usage`）。
+     * 不同接口的资源包列表位置不一致（`data.Accounts` / `data.Response.Data.Accounts`），
+     * 字段大小写也不统一，因此这里递归找数组、按多个候选键取值。
+     */
+    fun fetchUsage(): UsageSnapshot {
+        val accounts = mutableListOf<JSONObject>()
+
+        // 主接口：账号下全部资源包（免费 + 付费）
+        runCatching {
+            val data = callEnvelope(
+                "POST", "/billing/meter/get-user-resource",
+                JSONObject().put("PageNumber", 1).put("PageSize", USAGE_PACK_LIMIT)
+            )
+            accounts += accountsOf(data)
+        }
+        // 兜底：主接口结构变了就改用已购包列表
+        if (accounts.isEmpty()) {
+            runCatching {
+                val data = callEnvelope(
+                    "POST", "/billing/meter/get-user-resource-paid-packages",
+                    JSONObject().put("PageNumber", 1).put("PageSize", USAGE_PACK_LIMIT)
+                )
+                accounts += accountsOf(data)
+            }
+        }
+        if (accounts.isEmpty()) throw IllegalStateException("积分接口未返回资源包")
+
+        val packs = accounts.distinctBy { it.toString() }.mapNotNull { o ->
+            val total = numberOf(o, "Total", "total", "Capacity", "capacity")
+            val left = numberOf(o, "left", "Left", "Remain", "Remaining", "remain", "Balance")
+            if (total == null && left == null) return@mapNotNull null
+            UsagePack(
+                name = o.optString("PackageName").ifBlank {
+                    o.optString("PackageCode").ifBlank { "积分包" }
+                },
+                total = total ?: 0.0,
+                left = left ?: 0.0,
+                status = o.optString("Status").takeIf { it.isNotBlank() },
+                expireAt = o.optString("ExpiredTime").ifBlank { o.optString("DeductionEndTime") }
+                    .takeIf { it.isNotBlank() }
+            )
+        }
+        if (packs.isEmpty()) throw IllegalStateException("积分接口字段无法识别")
+
+        // 今日用量失败不影响余额展示
+        return UsageSnapshot(packs = packs, todayRequests = runCatching { todayRequests() }.getOrNull())
+    }
+
+    /** 今日请求次数：优先取信封里的 `total`，否则数列表长度。 */
+    private fun todayRequests(): Int? {
+        val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+        val end = fmt.format(Date())
+        val calendar = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+        }
+        val body = JSONObject()
+            .put("startTime", fmt.format(calendar.time))
+            .put("endTime", end)
+            .put("pageNum", 1)
+            .put("pageSize", 1)
+        val data = callEnvelope("POST", "/billing/meter/get-user-daily-usage", body) ?: return null
+        (data.opt("total") as? Number)?.let { return it.toInt() }
+        return data.optJSONArray("data")?.length() ?: data.optJSONArray("list")?.length()
+    }
+
+    /** 递归找资源包数组（`Accounts`），各接口层级不一。 */
+    private fun accountsOf(node: Any?): List<JSONObject> = when (node) {
+        is JSONObject -> {
+            val direct = node.optJSONArray("Accounts") ?: node.optJSONArray("accounts")
+            if (direct != null) {
+                (0 until direct.length()).mapNotNull { direct.optJSONObject(it) }
+            } else {
+                node.keys().asSequence().mapNotNull { accountsOf(node.opt(it)) }.firstOrNull().orEmpty()
+            }
+        }
+
+        is JSONArray -> (0 until node.length()).asSequence()
+            .mapNotNull { accountsOf(node.opt(it)) }.firstOrNull().orEmpty()
+
+        else -> emptyList()
+    }
+
+    /** 按候选键取数值，兼容数字与数字字符串两种形态。 */
+    private fun numberOf(o: JSONObject, vararg keys: String): Double? {
+        keys.forEach { key ->
+            val d = when (val v = o.opt(key)) {
+                is Number -> v.toDouble()
+                is String -> v.toDoubleOrNull()
+                else -> null
+            }
+            if (d != null && d.isFinite()) return d
+        }
+        return null
+    }
+
     // ---------- 产物上传 / 下载 ----------
 
     /**
@@ -373,6 +479,8 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             setRequestProperty("Accept", if (json) "application/json, text/plain, */*" else "*/*")
             setRequestProperty(REQUEST_ID_HEADER, nextRequestId())
             setRequestProperty("X-Submitted-From", SUBMITTED_FROM)
+            // billing 接口按来源分流（web / miniProgram），缺省会拿到非预期结构
+            setRequestProperty("X-Client-Platform", CLIENT_PLATFORM)
             if (body != null) {
                 doOutput = true
                 setRequestProperty("Content-Type", "application/json; charset=utf-8")
@@ -665,6 +773,13 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         )
         /** 与 web 端保持一致，避免服务端按来源校验时被拒。 */
         private const val SUBMITTED_FROM = "web"
+
+        /** billing 接口按来源分流，web 端固定传 `web`。 */
+        private const val CLIENT_PLATFORM = "web"
+
+        /** 积分资源包一次最多拉取的条数。 */
+        private const val USAGE_PACK_LIMIT = 100
+
         private const val CONVERSATION_ORIGINS =
             "agents,workbuddy-mp,workbuddy-app,openapi,workbuddy-deploy"
 

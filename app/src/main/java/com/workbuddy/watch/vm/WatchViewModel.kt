@@ -16,9 +16,12 @@ import com.workbuddy.watch.data.ExecEnv
 import com.workbuddy.watch.data.FakeTaskRepository
 import com.workbuddy.watch.data.NativeLogin
 import com.workbuddy.watch.data.RemoteModel
+import com.workbuddy.watch.data.SessionExpiredException
 import com.workbuddy.watch.data.Task
 import com.workbuddy.watch.data.TaskRepository
 import com.workbuddy.watch.data.TaskStatus
+import com.workbuddy.watch.data.UsageSnapshot
+import com.workbuddy.watch.data.WorkBuddyCloudClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -32,7 +35,8 @@ import android.webkit.WebView
 import java.io.File
 
 enum class Screen {
-    HOME, CONFIRM, RUNNING, RESULT, LIST, HISTORY_DETAIL, ERROR, SETTINGS, MODELS, LOGIN, LOGIN_WEB, ASK, ABOUT
+    HOME, CONFIRM, RUNNING, RESULT, LIST, HISTORY_DETAIL, ERROR, SETTINGS, MODELS, LOGIN, LOGIN_WEB,
+    ASK, ABOUT, USAGE
 }
 enum class Sheet { NONE, CONN, STOP, FOLLOWUP }
 
@@ -92,7 +96,11 @@ data class WatchUiState(
     val history: List<ChatMessage> = emptyList(),
     val historyTitle: String = "",
     val historyLoading: Boolean = false,
-    val historyError: String? = null
+    val historyError: String? = null,
+    /** 积分用量：登录后从 `/billing/meter` 接口拉取。 */
+    val usage: UsageSnapshot? = null,
+    val usageLoading: Boolean = false,
+    val usageError: String? = null
 ) {
     val activeTask: Task? get() = tasks.firstOrNull { it.id == activeTaskId }
     val workingTask: Task? get() = tasks.firstOrNull { it.status == TaskStatus.WORKING || it.status == TaskStatus.BLOCKED }
@@ -445,6 +453,36 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
     fun openAbout() = _ui.update { it.copy(screen = Screen.ABOUT, sheet = Sheet.NONE) }
 
     fun closeAbout() = _ui.update { it.copy(screen = Screen.HOME) }
+
+    // ---------- 积分用量 ----------
+
+    fun openUsage() {
+        _ui.update { it.copy(screen = Screen.USAGE, sheet = Sheet.NONE, usageError = null) }
+        loadUsage()
+    }
+
+    fun closeUsage() = _ui.update { it.copy(screen = Screen.HOME) }
+
+    /** 拉取积分；未登录直接给出提示，不发请求。 */
+    fun loadUsage() {
+        if (!settings.isLoggedIn) {
+            _ui.update { it.copy(usage = null, usageLoading = false, usageError = "请先登录") }
+            return
+        }
+        if (_ui.value.usageLoading) return
+        _ui.update { it.copy(usageLoading = true, usageError = null) }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { WorkBuddyCloudClient(settings).fetchUsage() }
+            }
+            result.onSuccess { snap ->
+                _ui.update { it.copy(usage = snap, usageLoading = false) }
+            }.onFailure { e ->
+                if (e is SessionExpiredException) onSessionExpired()
+                _ui.update { it.copy(usageLoading = false, usageError = e.message ?: "积分加载失败") }
+            }
+        }
+    }
 
     // ---------- 引导页 / 表盘形状 ----------
 

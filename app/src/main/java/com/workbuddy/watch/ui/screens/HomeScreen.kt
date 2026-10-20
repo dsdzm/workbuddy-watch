@@ -5,6 +5,7 @@ import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Paid
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -48,6 +49,7 @@ fun HomeScreen(
     onPickFile: () -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onList: () -> Unit,
+    onUsage: () -> Unit,
     onSettings: () -> Unit,
     onAbout: () -> Unit,
     onConn: () -> Unit,
@@ -77,6 +79,7 @@ fun HomeScreen(
                 unreadCount = unreadCount,
                 uploading = uploading,
                 onList = onList,
+                onUsage = onUsage,
                 onConn = onConn,
                 onPickFile = onPickFile,
                 onSettings = onSettings,
@@ -167,6 +170,7 @@ private fun MenuPage(
     unreadCount: Int,
     uploading: Boolean,
     onList: () -> Unit,
+    onUsage: () -> Unit,
     onConn: () -> Unit,
     onPickFile: () -> Unit,
     onSettings: () -> Unit,
@@ -182,6 +186,14 @@ private fun MenuPage(
                 leadingIcon = Icons.Filled.History,
                 trailing = if (unreadCount > 0) "$unreadCount 条新" else null,
                 onClick = onList
+            )
+        }
+        item {
+            PillRow(
+                title = "积分用量",
+                subtitle = "剩余积分 / 今日调用",
+                leadingIcon = Icons.Filled.Paid,
+                onClick = onUsage
             )
         }
         item {

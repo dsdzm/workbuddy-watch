@@ -37,6 +37,7 @@ import com.workbuddy.watch.ui.screens.OnboardScreen
 import com.workbuddy.watch.ui.screens.ResultScreen
 import com.workbuddy.watch.ui.screens.RunningScreen
 import com.workbuddy.watch.ui.screens.SettingsScreen
+import com.workbuddy.watch.ui.screens.UsageScreen
 import com.workbuddy.watch.ui.screens.WebLoginScreen
 import com.workbuddy.watch.ui.sheets.SheetHost
 import com.workbuddy.watch.ui.theme.WorkBuddyWatchTheme
@@ -83,6 +84,7 @@ private fun WatchApp(vm: WatchViewModel = viewModel()) {
         Screen.HISTORY_DETAIL -> vm::closeHistory
         Screen.SETTINGS -> vm::closeSettings
         Screen.MODELS -> vm::closeModels
+        Screen.USAGE -> vm::closeUsage
         Screen.ABOUT -> vm::closeAbout
         Screen.LOGIN -> vm::cancelLogin
         Screen.LOGIN_WEB -> vm::cancelWebLogin
@@ -116,6 +118,7 @@ private fun WatchApp(vm: WatchViewModel = viewModel()) {
                     },
                     onRemoveAttachment = vm::removeAttachment,
                     onList = vm::openList,
+                    onUsage = vm::openUsage,
                     onSettings = vm::openSettings,
                     onAbout = vm::openAbout,
                     onConn = vm::openConn,
@@ -242,6 +245,17 @@ private fun WatchApp(vm: WatchViewModel = viewModel()) {
                     roundScreen = state.roundScreen,
                     version = BuildConfig.VERSION_NAME,
                     onBack = vm::closeAbout
+                )
+
+                Screen.USAGE -> UsageScreen(
+                    roundScreen = state.roundScreen,
+                    usage = state.usage,
+                    loading = state.usageLoading,
+                    error = state.usageError,
+                    loggedIn = state.loggedIn,
+                    onLogin = vm::openLogin,
+                    onReload = vm::loadUsage,
+                    onBack = vm::closeUsage
                 )
             }
 
