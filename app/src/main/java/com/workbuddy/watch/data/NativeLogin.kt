@@ -112,7 +112,7 @@ class NativeLogin(private val settings: CloudSettings) {
             .put("sms_code", code.trim())
             .put("skip_enterprise", true)
             .toString()
-        val res = call("POST", authV2(VERIFY_PATH), payload, follow = true, jsonLike = true)
+        val res = call("POST", authV2(PHONE_VERIFY_PATH), payload, follow = true, jsonLike = true)
         val json = runCatching { JSONObject(res.body) }.getOrNull()
 
         if (json?.optString("status") != "ok") throw IllegalStateException(verifyErrorText(json))
@@ -189,7 +189,7 @@ class NativeLogin(private val settings: CloudSettings) {
 
     /** 用登录后的会话请求一次会话列表，确认登录真的生效。 */
     private fun verify(): Boolean {
-        val res = call("GET", base() + VERIFY_PATH, null, follow = true)
+        val res = call("GET", base() + SESSION_PROBE_PATH, null, follow = true)
         val envelope = runCatching { JSONObject(res.body).optInt("code", -1) }.getOrDefault(-1)
         return res.status in 200..299 && envelope == 0
     }
@@ -331,13 +331,15 @@ class NativeLogin(private val settings: CloudSettings) {
 
         /** 未登录时会被网关重定向到 Keycloak 的入口（官方 web 端也是用它探测登录态）。 */
         private const val OIDC_ENTRY = "/console/accounts"
-        private const val VERIFY_PATH = "/console/as/conversations/?type=cloud&page=1&size=1"
+        /** 登录态探测：能正常返回 envelope 即说明会话已生效。 */
+        private const val SESSION_PROBE_PATH = "/console/as/conversations/?type=cloud&page=1&size=1"
 
         /** auth-v2 手机号登录链路（取自官方登录页 bundle）。 */
         private const val AUTH_V2 = "/auth-v2/realms/copilot/signin"
         private const val PHONE_LOGIN_PATH = "/phone/login"
         private const val SMS_PATH = "/phone/sms"
-        private const val VERIFY_PATH_V2 = "/phone/verify"
+        /** 提交短信验证码。注意不要和 [SESSION_PROBE_PATH] 混用。 */
+        private const val PHONE_VERIFY_PATH = "/phone/verify"
         private const val FINALIZE_PATH = "/finalize"
         private const val SHORT_SESSION_PATH = "/session"
 
