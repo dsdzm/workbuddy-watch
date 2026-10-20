@@ -115,7 +115,7 @@ class NativeLogin(private val settings: CloudSettings) {
         val res = call("POST", authV2(PHONE_VERIFY_PATH), payload, follow = true, jsonLike = true)
         val json = runCatching { JSONObject(res.body) }.getOrNull()
 
-        if (json?.optString("status") != "ok") throw IllegalStateException(verifyErrorText(json))
+        if (json?.optString("status") != "ok") throw IllegalStateException(verifyErrorText(json, res.status))
         val ticket = json.optString("ticket")
         if (ticket.isBlank()) throw IllegalStateException("登录票据缺失，请重新获取验证码")
 
@@ -215,12 +215,26 @@ class NativeLogin(private val settings: CloudSettings) {
         }
     }
 
-    /** 校验阶段的错误。 */
-    private fun verifyErrorText(json: JSONObject?): String = when (json?.optString("error")) {
-        "invalid_grant" -> "验证码错误或已失效，请重新输入"
-        "invalid_session" -> "登录会话已失效，请重新获取验证码"
-        "account_unavailable" -> "该账号暂不可用，请更换手机号"
-        else -> "验证码校验失败，请重新输入"
+    /**
+     * 校验阶段的错误。
+     *
+     * 服务端实测返回 `400 {"errno":"invalid_sms_code","error":"invalid_grant",…}`，
+     * `errno` 与 `error` 两套字段都要看。兜底分支带上 HTTP 状态码与原始字段，
+     * 避免「解析失败」和「验证码错误」被同一句话盖住、无法定位。
+     */
+    private fun verifyErrorText(json: JSONObject?, status: Int): String {
+        val error = json?.optString("error").orEmpty()
+        val errno = json?.optString("errno").orEmpty()
+        val desc = json?.optString("error_description").orEmpty()
+        return when {
+            error == "invalid_grant" || errno == "invalid_sms_code" -> "验证码错误或已失效，请重新输入"
+            error == "invalid_session" || errno == "invalid_session" -> "登录会话已失效，请重新获取验证码"
+            error == "account_unavailable" || errno == "account_unavailable" -> "该账号暂不可用，请更换手机号"
+            desc.isNotBlank() -> "验证码校验失败（$desc）"
+            errno.isNotBlank() -> "验证码校验失败（$errno）"
+            error.isNotBlank() -> "验证码校验失败（$error）"
+            else -> "验证码校验失败（HTTP $status，响应无法解析）"
+        }
     }
 
     private fun authV2(path: String) = base() + AUTH_V2 + path
