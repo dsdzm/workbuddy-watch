@@ -1,0 +1,18 @@
+# Gradle 构建产物与缓存
+.gradle/
+build/
+app/build/
+
+# 本机路径配置（含 sdk.dir，各机器不同）
+local.properties
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 系统
+.DS_Store
+Thumbs.db

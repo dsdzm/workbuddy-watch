@@ -1,0 +1,275 @@
+package com.workbuddy.watch.data
+
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/**
+ * 云端任务数据源：手表脱离手机，直接调用 WorkBuddy「云上模式」。
+ *
+ * 状态同步用轮询而非常驻 SSE：手表息屏时系统会回收长连接，轮询更稳。
+ * 下发/追问/中断走 [WorkBuddyCloudClient] 的 ACP 调用（session/prompt、session/cancel）。
+ */
+class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository {
+
+    private val client = WorkBuddyCloudClient(settings)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val pollers = mutableMapOf<String, Job>()
+
+    /** 会话接入点缓存（link/token），供追问与中断复用，避免每次重复握手。 */
+    private val sessions = mutableMapOf<String, WorkBuddyCloudClient.Session>()
+
+    private val _tasks = MutableStateFlow<List<Task>>(emptyList())
+    override val tasks: StateFlow<List<Task>> = _tasks.asStateFlow()
+
+    private val _connected = MutableStateFlow(false)
+    override val connected: StateFlow<Boolean> = _connected.asStateFlow()
+
+    private val _cloudError = MutableStateFlow<String?>(null)
+    override val cloudError: StateFlow<String?> = _cloudError.asStateFlow()
+
+    private val _sessionExpired = MutableStateFlow(false)
+    override val sessionExpired: StateFlow<Boolean> = _sessionExpired.asStateFlow()
+
+    init {
+        scope.launch { refreshList() }
+        scope.launch { healthLoop() }
+    }
+
+    override suspend fun dispatch(prompt: String, env: ExecEnv, attachments: List<Artifact>): String =
+        withContext(Dispatchers.IO) {
+            // 用户在设置里选过模型就用选中的，否则回退 web 端同款默认模型
+            val model = settings.selectedModel.ifBlank { WorkBuddyCloudClient.DEFAULT_MODEL }
+            val conversation = client.createConversation(prompt, model)
+            val session = conversation.session ?: client.fetchSession(conversation.id)
+            sessions[conversation.id] = session
+            // 附件以 resource_link 内容块单独下发（首轮指令已随创建会话的请求发出，不重复文本）
+            if (attachments.isNotEmpty()) client.sendPrompt(session, "", attachments)
+            val task = Task(
+                id = conversation.id,
+                title = conversation.title ?: prompt,
+                status = TaskStatus.WORKING,
+                env = env,
+                doneSteps = 0,
+                totalSteps = 0 // 云端不回传步数，腕上用不确定进度展示
+            )
+            _tasks.update { listOf(task) + it }
+            startPolling(conversation.id)
+            conversation.id
+        }
+
+    override suspend fun reply(id: String, prompt: String) = withContext(Dispatchers.IO) {
+        client.sendPrompt(sessionOf(id), prompt)
+        updateTask(id) { it.copy(status = TaskStatus.WORKING, error = null, ask = null) }
+        startPolling(id)
+    }
+
+    /**
+     * 回答 askuser：拿到中断 ID 时走 ACP 精确回传，否则退化为普通追问，
+     * 让云端按「用户补充信息」继续。
+     */
+    override suspend fun answerAsk(id: String, answer: String) = withContext(Dispatchers.IO) {
+        val task = _tasks.value.firstOrNull { it.id == id } ?: return@withContext
+        val session = sessionOf(id)
+        val ask = task.ask
+        if (ask?.requestId != null) {
+            client.resolveInterruption(session, ask, answer)
+        } else {
+            client.sendPrompt(session, answer)
+        }
+        updateTask(id) { it.copy(status = TaskStatus.WORKING, ask = null, unread = false, error = null) }
+        startPolling(id)
+    }
+
+    override suspend fun uploadAttachment(name: String, mimeType: String, bytes: ByteArray): Artifact =
+        withContext(Dispatchers.IO) { client.uploadFile(name, mimeType, bytes) }
+
+    override suspend fun downloadArtifact(artifact: Artifact): ByteArray =
+        withContext(Dispatchers.IO) { client.downloadArtifact(artifact) }
+
+    /**
+     * 历史对话详情：走 ACP `session/load` 把整段会话回放到 SSE 流上（与网页端一致）。
+     * 会话接入点优先复用轮询里已缓存的那份，没有就现取一次。
+     */
+    override suspend fun loadHistory(id: String): List<ChatMessage> =
+        withContext(Dispatchers.IO) { client.loadHistory(sessionOf(id)) }
+
+    override suspend fun listModels(): List<RemoteModel> =
+        withContext(Dispatchers.IO) { client.listModels(settings.enterpriseId) }
+
+    override fun stop(id: String) {
+        pollers.remove(id)?.cancel()
+        updateTask(id) { it.copy(status = TaskStatus.STOPPED, unread = false) }
+        scope.launch { runCatching { client.cancelTurn(sessionOf(id)) } }
+    }
+
+    override suspend fun retry(id: String) = withContext(Dispatchers.IO) {
+        val prompt = _tasks.value.firstOrNull { it.id == id }?.title.orEmpty()
+        if (sessionOf(id).let { runCatching { client.sendPrompt(it, prompt) }.isSuccess }) {
+            updateTask(id) { it.copy(status = TaskStatus.WORKING, error = null) }
+            startPolling(id)
+        }
+    }
+
+    override fun markRead(id: String) {
+        updateTask(id) { it.copy(unread = false) }
+    }
+
+    override fun markDownloaded(taskId: String, uri: String, localPath: String) {
+        updateTask(taskId) { t ->
+            val files = t.result?.files.orEmpty().map { if (it.uri == uri) it.copy(localPath = localPath) else it }
+            t.copy(result = t.result?.copy(files = files))
+        }
+    }
+
+    /** 切换配置时释放旧的轮询协程。 */
+    fun close() {
+        scope.cancel()
+    }
+
+    // ---------- 内部 ----------
+
+    private fun sessionOf(id: String): WorkBuddyCloudClient.Session =
+        sessions[id] ?: client.fetchSession(id).also { sessions[id] = it }
+
+    private suspend fun refreshList() {
+        runCatching { client.listConversations() }
+            .onSuccess { remote ->
+                markHealthy()
+                val mapped = remote.map { it.toTask(envOf(it.id)) }
+                if (mapped.isNotEmpty()) {
+                    _tasks.update { local -> merge(local, mapped) }
+                }
+            }
+            .onFailure { markUnhealthy(it) }
+    }
+
+    private suspend fun healthLoop() {
+        while (scope.isActive) {
+            runCatching { client.listConversations(size = 1) }
+                .onSuccess { markHealthy() }
+                .onFailure { markUnhealthy(it) }
+            delay(20_000)
+        }
+    }
+
+    private fun markHealthy() {
+        _connected.value = true
+        _cloudError.value = null
+    }
+
+    /** 把异常转成用户能看懂的一句话，直接显示在首页「未连通」提示里。 */
+    private fun markUnhealthy(error: Throwable) {
+        _connected.value = false
+        _cloudError.value = when (error) {
+            is SessionExpiredException -> {
+                // 网关已不认这份登录态且静默续期也失败：交给界面回到「重新登录」入口
+                _sessionExpired.value = true
+                "登录已过期，请重新登录"
+            }
+            is java.net.UnknownHostException, is java.net.ConnectException -> "网络不可用，请检查手表网络"
+            is java.net.SocketTimeoutException -> "请求超时，请稍后重试"
+            is javax.net.ssl.SSLException -> "网络连接不安全，请检查网络"
+            else -> (error.message ?: error.javaClass.simpleName).take(80)
+        }
+    }
+
+    private fun startPolling(id: String) {
+        pollers.remove(id)?.cancel()
+        pollers[id] = scope.launch {
+            while (isActive) {
+                delay(2000)
+                val remote = runCatching { client.getConversation(id) }.getOrNull() ?: continue
+                val status = remote.status.toTaskStatus()
+                if (status == TaskStatus.WORKING) remote.session?.let { sessions[id] = it }
+                updateTask(id) { t ->
+                    t.copy(
+                        status = status,
+                        title = remote.title ?: t.title,
+                        error = if (status == TaskStatus.FAILED) "云端执行失败" else null,
+                        unread = status == TaskStatus.DONE || status == TaskStatus.FAILED ||
+                            (status == TaskStatus.BLOCKED && t.ask == null),
+                        // 等待补充信息时给出云端抛出的问题
+                        ask = if (status == TaskStatus.BLOCKED) (remote.ask ?: t.ask) else null,
+                        result = if (status == TaskStatus.DONE) cloudResult(remote, t.result) else t.result
+                    )
+                }
+                if (status.isTerminal()) return@launch
+            }
+        }
+    }
+
+    /** 云端结果：把会话里解析到的产物挂到结果上，并保留已下载的本地路径。 */
+    private fun cloudResult(
+        remote: WorkBuddyCloudClient.RemoteConversation,
+        prev: TaskResult?
+    ): TaskResult {
+        val downloaded = prev?.files.orEmpty()
+            .mapNotNull { f -> f.localPath?.let { f.uri to it } }
+            .toMap()
+        val files = remote.artifacts.map { a ->
+            downloaded[a.uri]?.let { a.copy(localPath = it) } ?: a
+        }
+        val points = buildList {
+            add("任务已在云端完成")
+            if (files.isNotEmpty()) add("已产出 ${files.size} 个文件，可在手表下载")
+            else add("完整结果请在手机或电脑上查看")
+        }
+        return TaskResult(points = points, files = files)
+    }
+
+    private fun TaskStatus.isTerminal() =
+        this == TaskStatus.DONE || this == TaskStatus.FAILED || this == TaskStatus.STOPPED
+
+    private fun envOf(id: String): ExecEnv =
+        _tasks.value.firstOrNull { it.id == id }?.env ?: ExecEnv.CLOUD
+
+    private fun updateTask(id: String, transform: (Task) -> Task) {
+        _tasks.update { list -> list.map { if (it.id == id) transform(it) else it } }
+    }
+
+    private fun merge(local: List<Task>, remote: List<Task>): List<Task> {
+        val remoteIds = remote.map { it.id }.toSet()
+        val kept = local.filter { it.id !in remoteIds }
+        return remote + kept
+    }
+
+    private fun WorkBuddyCloudClient.RemoteConversation.toTask(env: ExecEnv): Task {
+        val status = this.status.toTaskStatus()
+        return Task(
+            id = id,
+            title = title ?: "云端任务",
+            status = status,
+            env = env,
+            doneSteps = 0,
+            totalSteps = 0,
+            error = if (status == TaskStatus.FAILED) "云端执行失败" else null,
+            ask = if (status == TaskStatus.BLOCKED) ask else null,
+            result = if (status == TaskStatus.DONE) cloudResult(this, null) else null
+        )
+    }
+
+    /**
+     * 云上状态原值映射为腕上状态。
+     * 除 RUNNING / COMPLETED / CANCELLED / EXPIRED 外，云端在等用户补充信息时会给出
+     * `WAITING_USER_INPUT` 一类状态，统一映射为 [TaskStatus.BLOCKED] 以便腕上弹出问题。
+     */
+    private fun String.toTaskStatus(): TaskStatus = when (uppercase()) {
+        "RUNNING", "PENDING", "IN_PROGRESS", "PROCESSING" -> TaskStatus.WORKING
+        "COMPLETED", "SUCCESS", "DONE" -> TaskStatus.DONE
+        "WAITING_USER_INPUT", "WAITING_INPUT", "REQUIRES_ACTION", "PAUSED", "BLOCKED" -> TaskStatus.BLOCKED
+        "CANCELLED", "CANCELED" -> TaskStatus.STOPPED
+        "EXPIRED", "FAILED", "ERROR" -> TaskStatus.FAILED
+        else -> TaskStatus.WORKING
+    }
+}
