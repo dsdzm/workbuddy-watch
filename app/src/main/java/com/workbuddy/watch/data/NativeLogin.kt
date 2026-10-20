@@ -115,8 +115,25 @@ class NativeLogin(private val settings: CloudSettings) {
         val res = call("POST", authV2(PHONE_VERIFY_PATH), payload, follow = true, jsonLike = true)
         val json = runCatching { JSONObject(res.body) }.getOrNull()
 
-        if (json?.optString("status") != "ok") throw IllegalStateException(verifyErrorText(json, res.status))
-        val ticket = json.optString("ticket")
+        // 官方前端的成功状态是 ready_to_login（带 ticket），**不是 "ok"**：
+        //   status === "ready_to_login"  -> {ticket}
+        //   status === "oneid_required"  -> {state_token}
+        //   status === "confirm_bind"    -> {confirm_token, phone, identity}
+        // 后两种要走企业身份 / 手机号绑定确认，本机没有对应界面，只能引导去官方页面。
+        val status = json?.optString("status").orEmpty()
+        when (status) {
+            "ready_to_login" -> Unit
+            "oneid_required" -> throw IllegalStateException(
+                "该账号需要企业身份验证，请改用手机上的官方页面登录"
+            )
+
+            "confirm_bind" -> throw IllegalStateException(
+                "该手机号需要确认绑定，请改用手机上的官方页面登录"
+            )
+
+            else -> throw IllegalStateException(verifyErrorText(json, res.status))
+        }
+        val ticket = json?.optString("ticket").orEmpty()
         if (ticket.isBlank()) throw IllegalStateException("登录票据缺失，请重新获取验证码")
 
         // finalize 直接签发 OIDC authorization code
@@ -233,6 +250,9 @@ class NativeLogin(private val settings: CloudSettings) {
             desc.isNotBlank() -> "验证码校验失败（$desc）"
             errno.isNotBlank() -> "验证码校验失败（$errno）"
             error.isNotBlank() -> "验证码校验失败（$error）"
+            json != null && json.optString("status").isNotBlank() ->
+                "验证码校验失败（HTTP $status，status=${json.optString("status")}）"
+
             else -> "验证码校验失败（HTTP $status，响应无法解析）"
         }
     }
