@@ -13,8 +13,8 @@ android {
         // Android 9 = API 28。WearOS 与非 WearOS 的 Android 9 手表都 >= 28。
         minSdk = 28
         targetSdk = 35
-        versionCode = 15
-        versionName = "1.1.3"
+        versionCode = 16
+        versionName = "1.1.4"
     }
 
     // Release 专用签名：手表上侧载安装需要固定签名，便于后续覆盖升级。

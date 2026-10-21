@@ -250,29 +250,7 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
     fun sendPrompt(session: Session, text: String, attachments: List<Artifact> = emptyList()) {
         val blocks = JSONArray()
         if (text.isNotBlank()) blocks.put(JSONObject().put("type", "text").put("text", text))
-        attachments.forEach { a ->
-            val mime = a.mimeType.orEmpty()
-            if (mime.startsWith("image/")) {
-                val bytes = inlineBytes(a)
-                if (bytes != null && bytes.isNotEmpty() && bytes.size <= MAX_INLINE_IMAGE) {
-                    blocks.put(
-                        JSONObject()
-                            .put("type", "image")
-                            .put("mimeType", mime)
-                            .put("data", Base64.getEncoder().encodeToString(bytes))
-                    )
-                    return@forEach
-                }
-            }
-            blocks.put(
-                JSONObject()
-                    .put("type", "resource_link")
-                    .put("name", a.name)
-                    .put("title", a.name)
-                    .put("uri", a.uri)
-                    .apply { a.mimeType?.let { put("mimeType", it) } }
-            )
-        }
+        attachments.forEach { a -> blocks.put(contentBlock(a)) }
         val params = JSONObject()
             .put("sessionId", session.conversationId)
             .put("cwd", session.cwd.orEmpty())
@@ -281,7 +259,52 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         linkOf(session).rpc(ACP_PROMPT, params, PROMPT_READ_TIMEOUT)
     }
 
-    /** 内联图片用的原始字节：优先取上传时缓存的那份，没有再按预签名地址下载。 */
+    /**
+     * 附件 → ACP 内容块。
+     *
+     * 只发 `resource_link` 的话，agent 沙箱读不到任何内容（它只看到一串 URI），
+     * 所以内容必须内联：图片走 `image`，文本走 `resource.text`，其它二进制走 `resource.blob`。
+     * 取不到字节或体积超限才退回链接，并尽量换成预签名下载地址，官方客户端才能点开。
+     */
+    private fun contentBlock(a: Artifact): JSONObject {
+        val mime = a.mimeType.orEmpty()
+        val bytes = inlineBytes(a)
+        if (bytes != null && bytes.isNotEmpty()) {
+            if (mime.startsWith("image/") && bytes.size <= MAX_INLINE_IMAGE) {
+                return JSONObject()
+                    .put("type", "image")
+                    .put("mimeType", mime)
+                    .put("data", Base64.getEncoder().encodeToString(bytes))
+            }
+            if (bytes.size <= MAX_INLINE_IMAGE) {
+                val res = JSONObject().put("uri", a.uri).put("mimeType", mime)
+                if (isTextLike(mime, a.name)) {
+                    res.put("text", String(bytes, Charsets.UTF_8))
+                } else {
+                    res.put("blob", Base64.getEncoder().encodeToString(bytes))
+                }
+                return JSONObject().put("type", "resource").put("resource", res)
+            }
+        }
+        return JSONObject()
+            .put("type", "resource_link")
+            .put("name", a.name)
+            .put("title", a.name)
+            .put("uri", presignedDownloadUrl(a) ?: a.uri)
+            .apply { a.mimeType?.let { put("mimeType", it) } }
+    }
+
+    /** 能按纯文本读的 MIME / 扩展名（这类文件内联成 resource.text，agent 可直接读源码、日志、CSV）。 */
+    private fun isTextLike(mime: String, name: String): Boolean {
+        if (mime.startsWith("text/") || mime.contains("json") || mime.contains("xml")) return true
+        val ext = name.substringAfterLast('.', "").lowercase()
+        return ext in setOf(
+            "txt", "md", "csv", "tsv", "log", "yaml", "yml", "json", "xml", "html", "css",
+            "js", "ts", "kt", "java", "py", "go", "rs", "c", "h", "cpp", "sh", "sql", "ini", "conf"
+        )
+    }
+
+    /** 内联图片/文件用的原始字节：优先取上传时缓存的那份，没有再按预签名地址下载。 */
     private fun inlineBytes(artifact: Artifact): ByteArray? =
         uploadCache[artifact.uri] ?: runCatching { downloadArtifact(artifact) }.getOrNull()
 
@@ -498,11 +521,8 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
 
     /** 下载产物文件字节（换取预签名下载地址后 GET）。 */
     fun downloadArtifact(artifact: Artifact): ByteArray {
-        val key = objectKeyOf(artifact.uri)
-        val item = presign(listOf(key)).firstOrNull()
+        val url = presignedDownloadUrl(artifact)
             ?: throw IllegalStateException("下载失败：未取得预签名地址")
-        val url = item.optString("download_url")
-        if (url.isBlank()) throw IllegalStateException("下载失败：响应缺少 download_url")
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = CONNECT_TIMEOUT
@@ -516,6 +536,12 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             conn.disconnect()
         }
     }
+
+    /** 预签名下载地址；取不到返回 null（附件仍按原 URI 发送）。 */
+    private fun presignedDownloadUrl(artifact: Artifact): String? = runCatching {
+        val key = objectKeyOf(artifact.uri)
+        presign(listOf(key)).firstOrNull()?.optString("download_url")?.takeIf { it.isNotBlank() }
+    }.getOrNull()
 
     /** 取预签名条目（COS 上传/下载地址）。 */
     private fun presign(paths: List<String>): List<JSONObject> {

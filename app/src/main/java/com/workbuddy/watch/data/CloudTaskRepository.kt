@@ -84,7 +84,12 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
             // session/prompt 的 HTTP 响应要等整个回合跑完才返回，云端思考几分钟就会把
             // 连接读超时。指令在写出请求体时就已经送达，所以这里不等待响应：
             // 后台发出、忽略超时，进度交给上面的轮询。
-            deliver(conversation.id) { client.sendPrompt(session, prompt, attachments) }
+            deliver(conversation.id) {
+                // 新会话也必须显式设一次模型：create 里的 `model` 只写进会话元信息，
+                // 不设的话云端按账号默认模型跑（腕上选 DeepSeek、官方端却显示 Hy4 preview）
+                applyModel(conversation.id, session)
+                client.sendPrompt(session, prompt, attachments)
+            }
             conversation.id
         }
 
