@@ -37,6 +37,12 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
     /** 会话接入点缓存（link/token），供追问与中断复用，避免每次重复握手。 */
     private val sessions = mutableMapOf<String, WorkBuddyCloudClient.Session>()
 
+    /** 云端会话当前已生效的模型，避免每次都重复发 `session/set_model`。 */
+    private val serverModels = mutableMapOf<String, String>()
+
+    /** 用户已在腕上手动停止的会话：云端可能仍报执行中，不能被覆盖回 [TaskStatus.WORKING]。 */
+    private val stoppedIds = mutableSetOf<String>()
+
     private val _tasks = MutableStateFlow<List<Task>>(emptyList())
     override val tasks: StateFlow<List<Task>> = _tasks.asStateFlow()
 
@@ -78,14 +84,19 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
             // session/prompt 的 HTTP 响应要等整个回合跑完才返回，云端思考几分钟就会把
             // 连接读超时。指令在写出请求体时就已经送达，所以这里不等待响应：
             // 后台发出、忽略超时，进度交给上面的轮询。
-            deliver(conversation.id) { client.sendPrompt(session, prompt, attachments, model) }
+            deliver(conversation.id) { client.sendPrompt(session, prompt, attachments) }
             conversation.id
         }
 
     override suspend fun reply(id: String, prompt: String) = withContext(Dispatchers.IO) {
+        stoppedIds.remove(id)
         updateTask(id) { it.copy(status = TaskStatus.WORKING, error = null, ask = null) }
         startPolling(id)
-        deliver(id) { client.sendPrompt(sessionOf(id), prompt, emptyList(), currentModel()) }
+        deliver(id) {
+            val session = sessionOf(id)
+            applyModel(id, session)
+            client.sendPrompt(session, prompt)
+        }
     }
 
     /**
@@ -99,10 +110,11 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
         startPolling(id)
         deliver(id) {
             val session = sessionOf(id)
+            applyModel(id, session)
             if (ask?.requestId != null) {
                 client.resolveInterruption(session, ask, answer)
             } else {
-                client.sendPrompt(session, answer, emptyList(), currentModel())
+                client.sendPrompt(session, answer)
             }
         }
     }
@@ -125,15 +137,31 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
 
     override fun stop(id: String) {
         pollers.remove(id)?.cancel()
-        updateTask(id) { it.copy(status = TaskStatus.STOPPED, unread = false) }
-        scope.launch { runCatching { client.cancelTurn(sessionOf(id)) } }
+        stoppedIds.add(id)
+        updateTask(id) { it.copy(status = TaskStatus.STOPPED, unread = false, ask = null) }
+        // 云端中断是尽力而为：会话接入点可能已过期，重取一次再试。
+        // 腕上已经是终态，不会因为这次失败把界面翻回「执行中」。
+        scope.launch {
+            repeat(2) { attempt ->
+                if (runCatching { client.cancelTurn(sessionOf(id)) }.isSuccess) return@launch
+                if (attempt == 0) {
+                    sessions.remove(id)
+                    delay(500)
+                }
+            }
+        }
     }
 
     override suspend fun retry(id: String) = withContext(Dispatchers.IO) {
         val prompt = _tasks.value.firstOrNull { it.id == id }?.title.orEmpty()
+        stoppedIds.remove(id)
         updateTask(id) { it.copy(status = TaskStatus.WORKING, error = null) }
         startPolling(id)
-        deliver(id) { client.sendPrompt(sessionOf(id), prompt, emptyList(), currentModel()) }
+        deliver(id) {
+            val session = sessionOf(id)
+            applyModel(id, session)
+            client.sendPrompt(session, prompt)
+        }
     }
 
     override fun markRead(id: String) {
@@ -166,6 +194,18 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
         settings.selectedModel.ifBlank { WorkBuddyCloudClient.DEFAULT_MODEL }
 
     /**
+     * 让云端会话切到当前选中模型。
+     *
+     * 追问是新建一条 ACP 连接，模型不会自动继承，必须先 `session/set_model`；
+     * 设置失败也要继续下发，否则用户会卡在「点了没反应」。
+     */
+    private fun applyModel(id: String, session: WorkBuddyCloudClient.Session) {
+        val model = currentModel()
+        if (serverModels[id] == model) return
+        runCatching { client.setModel(session, model) }.onSuccess { serverModels[id] = model }
+    }
+
+    /**
      * 后台下发指令：界面不等 HTTP 响应，超时也不算失败。
      *
      * `session/prompt` 的响应要等云端把整个回合跑完才返回，思考几分钟就必然触发读超时。
@@ -194,6 +234,11 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
                 if (mapped.isNotEmpty()) {
                     _tasks.update { local -> merge(local, mapped) }
                 }
+                // 列表里仍标执行中的任务（含重启 app 前的）要接着盯，
+                // 否则云端早已结束、腕上却一直停在「执行中」
+                _tasks.value
+                    .filter { it.status == TaskStatus.WORKING && !pollers.containsKey(it.id) }
+                    .forEach { startPolling(it.id) }
             }
             .onFailure { markUnhealthy(it) }
     }
@@ -258,9 +303,13 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
                     backoff = (backoff * 2).coerceAtMost(MAX_POLL_INTERVAL)
                     continue
                 }
-                val status = remote.status.toTaskStatus()
-                if (status == TaskStatus.WORKING) remote.session?.let { sessions[id] = it }
+                val remoteStatus = remote.status.toTaskStatusOrNull()
+                if (remoteStatus == TaskStatus.WORKING) remote.session?.let { sessions[id] = it }
                 updateTask(id) { t ->
+                    // 用户已在腕上停止的会话，云端可能还报 RUNNING，不能把状态翻回去
+                    val status = remoteStatus?.takeUnless {
+                        t.status == TaskStatus.STOPPED && it == TaskStatus.WORKING
+                    } ?: t.status
                     t.copy(
                         status = status,
                         title = remote.title ?: t.title,
@@ -272,7 +321,8 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
                         result = if (status == TaskStatus.DONE) cloudResult(remote, t.result) else t.result
                     )
                 }
-                if (status.isTerminal()) return@launch
+                val now = _tasks.value.firstOrNull { it.id == id }?.status
+                if (now == null || now.isTerminal()) return@launch
                 backoff = (backoff * 2).coerceAtMost(MAX_POLL_INTERVAL)
             }
         }
@@ -307,14 +357,31 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
         _tasks.update { list -> list.map { if (it.id == id) transform(it) else it } }
     }
 
+    /**
+     * 合并云端列表与本地状态。
+     *
+     * 云端列表只给会话元信息，直接覆盖会把本地「已停止」翻回 RUNNING，
+     * 也会丢掉已下载的产物路径，所以同 ID 时择优合并。
+     */
     private fun merge(local: List<Task>, remote: List<Task>): List<Task> {
         val remoteIds = remote.map { it.id }.toSet()
-        val kept = local.filter { it.id !in remoteIds }
-        return remote + kept
+        val localById = local.associateBy { it.id }
+        val merged = remote.map { r ->
+            val l = localById[r.id] ?: return@map r
+            val keepStopped = (l.status == TaskStatus.STOPPED || stoppedIds.contains(r.id)) &&
+                r.status == TaskStatus.WORKING
+            r.copy(
+                status = if (keepStopped) TaskStatus.STOPPED else r.status,
+                result = r.result ?: l.result,
+                unread = if (keepStopped) false else r.unread
+            )
+        }
+        return merged + local.filter { it.id !in remoteIds }
     }
 
     private fun WorkBuddyCloudClient.RemoteConversation.toTask(env: ExecEnv): Task {
-        val status = this.status.toTaskStatus()
+        // 拿不到状态时按「已完成」处理：宁可显示结束，也不要永远转圈
+        val status = this.status.toTaskStatusOrNull() ?: TaskStatus.DONE
         return Task(
             id = id,
             title = title ?: "云端任务",
@@ -329,17 +396,23 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
     }
 
     /**
-     * 云上状态原值映射为腕上状态。
+     * 云上状态原值映射为腕上状态；无法识别时返回 null，交由调用方保留现状。
+     *
+     * 网页端把 `sessionStatus` 与 `status` 视为同义，且会话生命周期另有
+     * `active / completed / archived`，所以这里两类词都认。
+     * `IDLE` 表示回合已结束（网页端由 CANCELLED 映射而来），归为完成。
      * 除 RUNNING / COMPLETED / CANCELLED / EXPIRED 外，云端在等用户补充信息时会给出
      * `WAITING_USER_INPUT` 一类状态，统一映射为 [TaskStatus.BLOCKED] 以便腕上弹出问题。
      */
-    private fun String.toTaskStatus(): TaskStatus = when (uppercase()) {
-        "RUNNING", "PENDING", "IN_PROGRESS", "PROCESSING" -> TaskStatus.WORKING
-        "COMPLETED", "SUCCESS", "DONE" -> TaskStatus.DONE
+    private fun String.toTaskStatusOrNull(): TaskStatus? = when (uppercase()) {
+        "" -> null
+        "RUNNING", "PENDING", "IN_PROGRESS", "PROCESSING", "WORKING", "BUSY", "GENERATING",
+        "ACTIVE", "QUEUED", "STARTED" -> TaskStatus.WORKING
+        "COMPLETED", "COMPLETE", "SUCCESS", "DONE", "FINISHED", "IDLE", "ARCHIVED" -> TaskStatus.DONE
         "WAITING_USER_INPUT", "WAITING_INPUT", "REQUIRES_ACTION", "PAUSED", "BLOCKED" -> TaskStatus.BLOCKED
-        "CANCELLED", "CANCELED" -> TaskStatus.STOPPED
+        "CANCELLED", "CANCELED", "STOPPED", "ABORTED", "TERMINATED" -> TaskStatus.STOPPED
         "EXPIRED", "FAILED", "ERROR" -> TaskStatus.FAILED
-        else -> TaskStatus.WORKING
+        else -> null
     }
 
     private companion object {

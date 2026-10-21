@@ -228,16 +228,10 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
      * 下发或追问。[attachments] 会作为 ACP `resource_link` 内容块一并发送，
      * 让云端沙箱能直接读取这些已上传的文件。
      *
-     * [modelId] 非空时，在同一条 ACP 连接上先发一次 `session/set_model`。
-     * 建会话接口里的 `model` 只写进会话元信息，真正执行用的模型由 ACP 决定，
-     * 不补这一步就会出现「界面选了 DeepSeek、实际跑的是账号默认模型」。
+     * prompt 的响应要等云端整个回合结束，用短超时把调用方尽快放回；
+     * 指令已经随请求体送达，断开后云端仍会继续执行。
      */
-    fun sendPrompt(
-        session: Session,
-        text: String,
-        attachments: List<Artifact> = emptyList(),
-        modelId: String? = null
-    ) {
+    fun sendPrompt(session: Session, text: String, attachments: List<Artifact> = emptyList()) {
         val blocks = JSONArray()
         if (text.isNotBlank()) blocks.put(JSONObject().put("type", "text").put("text", text))
         attachments.forEach { a ->
@@ -255,16 +249,21 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             .put("cwd", session.cwd.orEmpty())
             .put("mcpServers", JSONArray())
             .put("prompt", blocks)
-        val prelude = modelId?.trim()?.takeIf { it.isNotBlank() }?.let { id ->
-            listOf(
-                ACP_SET_MODEL to JSONObject()
-                    .put("sessionId", session.conversationId)
-                    .put("modelId", id)
-            )
-        }.orEmpty()
-        // prompt 的响应要等云端整个回合结束，用短超时把调用方尽快放回；
-        // 指令已经随请求体送达，断开后云端仍会继续执行。
-        acpCall(session, ACP_PROMPT, params, timeoutMs = PROMPT_READ_TIMEOUT, prelude = prelude)
+        acpCall(session, ACP_PROMPT, params, timeoutMs = PROMPT_READ_TIMEOUT)
+    }
+
+    /**
+     * 设定本会话实际使用的大模型。
+     *
+     * 建会话接口里的 `model` 只写进会话元信息，真正执行用的模型由 ACP 决定，
+     * 所以追问换模型必须单独走这一步（网页端也是先 `setSessionModel` 再 `prompt`）。
+     */
+    fun setModel(session: Session, modelId: String) {
+        acpCall(
+            session,
+            ACP_SET_MODEL,
+            JSONObject().put("sessionId", session.conversationId).put("modelId", modelId)
+        )
     }
 
     /** 中断当前执行（非退出排队）。 */
@@ -595,8 +594,7 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         session: Session,
         method: String,
         params: JSONObject,
-        timeoutMs: Int = READ_TIMEOUT,
-        prelude: List<Pair<String, JSONObject>> = emptyList()
+        timeoutMs: Int = READ_TIMEOUT
     ) {
         val url = normalizeLink(session.link)
         val stream = (URL(url).openConnection() as HttpURLConnection).apply {
@@ -612,10 +610,6 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             val connectionId = stream.getHeaderField(ACP_CONNECTION_HEADER)
                 ?: throw IllegalStateException("ACP 握手失败：缺少 $ACP_CONNECTION_HEADER")
             val acpSessionToken = stream.getHeaderField(ACP_SESSION_TOKEN_HEADER)?.trim().orEmpty()
-            // 前置请求（如 session/set_model）尽力而为：旧会话不支持时不该拦住真正的下发
-            prelude.forEach { (m, p) ->
-                runCatching { postRpc(url, session.token, connectionId, acpSessionToken, m, p) }
-            }
             postRpc(url, session.token, connectionId, acpSessionToken, method, params, timeoutMs)
         } finally {
             runCatching { stream.disconnect() }
@@ -689,14 +683,24 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         if (o == null) return null
         val id = o.optString("id").ifBlank { o.optString("conversationId") }
         if (id.isBlank()) return null
-        val status = (o.optString("status").ifBlank { o.optString("sessionStatus") }).uppercase()
-            .ifBlank { "RUNNING" }
+        // 网页端把 sessionStatus 与 status 视为同义，会话生命周期另有 lifecycle
+        // （active / completed / archived）。这里按优先级取第一个有值的，
+        // 都取不到就留空——绝不能默认 RUNNING，否则界面会永远转圈。
+        val session = o.optJSONObject("session")
+        val status = sequenceOf(
+            o.optString("status"),
+            o.optString("sessionStatus"),
+            o.optString("lifecycle"),
+            session?.optString("sessionStatus").orEmpty(),
+            session?.optString("status").orEmpty(),
+            session?.optString("state").orEmpty()
+        ).firstOrNull { it.isNotBlank() }.orEmpty().uppercase()
         return RemoteConversation(
             id = id,
             title = o.optString("name").takeIf { it.isNotBlank() }
                 ?: o.optString("title").takeIf { it.isNotBlank() },
             status = status,
-            session = parseSession(id, o.optJSONObject("session")),
+            session = parseSession(id, session),
             artifacts = artifactsOf(raw),
             ask = askOf(o, status)
         )
