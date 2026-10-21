@@ -186,6 +186,17 @@ private fun WatchApp(vm: WatchViewModel = viewModel()) {
                     messages = state.history,
                     loading = state.historyLoading,
                     error = state.historyError,
+                    busy = state.historyBusy,
+                    draft = state.draft,
+                    modelLabel = state.modelLabel,
+                    models = state.models,
+                    modelsLoading = state.modelsLoading,
+                    modelsError = state.modelsError,
+                    selectedModel = state.selectedModel,
+                    onDraftChange = vm::setDraft,
+                    onSend = vm::sendHistoryMessage,
+                    onLoadModels = vm::loadModels,
+                    onChooseModel = vm::chooseModelInline,
                     onReload = { state.activeTaskId?.let { vm.openHistory(it) } },
                     onBack = vm::closeHistory
                 )

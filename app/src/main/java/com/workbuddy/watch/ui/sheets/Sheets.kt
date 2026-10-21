@@ -1,17 +1,19 @@
 package com.workbuddy.watch.ui.sheets
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.wear.compose.material3.MaterialTheme
@@ -30,12 +32,12 @@ import com.workbuddy.watch.vm.Sheet
 import com.workbuddy.watch.vm.WatchUiState
 
 /**
- * 全局底部弹层：连接 / 中断确认 / 追问。
+ * 全局弹层：连接 / 中断确认 / 追问。
  *
- * 与业务页同一套「纯黑底 + 灰药丸 + 淡紫蓝」风格：弹层底色纯黑、
- * 去掉默认拖拽把手，条目用 [PillRow]，按钮用药丸按钮，输入用 [PillTextField]。
+ * 不用 `ModalBottomSheet`：它在圆屏上从底部升起、两侧是直角，圆弧会把内容切掉。
+ * 这里改为铺满整屏的纯黑层，内容居中收窄到圆屏安全宽度，纵向可滚动，
+ * 视觉上仍与业务页同一套「纯黑底 + 灰药丸 + 淡紫蓝」风格。
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SheetHost(
     state: WatchUiState,
@@ -49,28 +51,28 @@ fun SheetHost(
     onDraftChange: (String) -> Unit
 ) {
     if (state.sheet == Sheet.NONE) return
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
-    ModalBottomSheet(
-        onDismissRequest = onClose,
-        sheetState = sheetState,
-        containerColor = WatchPalette.Background,
-        dragHandle = null
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(WatchPalette.Background),
+        contentAlignment = Alignment.Center
     ) {
         Column(
             modifier = Modifier
-                .fillMaxWidth()
+                .fillMaxHeight()
+                .fillMaxWidth(if (state.roundScreen) 0.72f else 1f)
                 .verticalScroll(rememberScrollState())
-                .navigationBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 10.dp)
+                .padding(horizontal = 4.dp)
+                .padding(top = 42.dp, bottom = 34.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             when (state.sheet) {
-                Sheet.CONN -> ConnContent(state, onSetEnv, onSetConnected, onOpenSettings, onOpenLogin)
+                Sheet.CONN -> ConnContent(state, onSetEnv, onSetConnected, onOpenSettings, onOpenLogin, onClose)
                 Sheet.STOP -> StopContent(onConfirmStop, onClose)
                 Sheet.FOLLOWUP -> FollowupContent(state, onQuickReply, onDraftChange, onClose)
                 Sheet.NONE -> Unit
             }
-            Spacer(Modifier.height(12.dp))
         }
     }
 }
@@ -81,7 +83,8 @@ private fun ConnContent(
     onSetEnv: (ExecEnv) -> Unit,
     onSetConnected: (Boolean) -> Unit,
     onOpenSettings: () -> Unit,
-    onOpenLogin: () -> Unit
+    onOpenLogin: () -> Unit,
+    onClose: () -> Unit
 ) {
     CenteredHeader("执行环境")
     Spacer(Modifier.height(10.dp))
@@ -115,6 +118,8 @@ private fun ConnContent(
             onClick = { onSetConnected(!state.connected) }
         )
     }
+    Spacer(Modifier.height(6.dp))
+    MutedPillButton(text = "完成", onClick = onClose)
 }
 
 @Composable

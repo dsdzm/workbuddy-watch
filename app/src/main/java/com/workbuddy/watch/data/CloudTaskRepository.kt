@@ -53,9 +53,6 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
             val conversation = client.createConversation(prompt, model)
             val session = conversation.session ?: client.fetchSession(conversation.id)
             sessions[conversation.id] = session
-            // 关键：create 里的 prompt 只截前 100 字用来生成会话标题，不会真正执行。
-            // 首轮指令必须通过 ACP session/prompt 下发，否则只会留下一个空会话。
-            client.sendPrompt(session, prompt, attachments)
             val task = Task(
                 id = conversation.id,
                 title = conversation.title ?: prompt,
@@ -65,14 +62,22 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
                 totalSteps = 0 // 云端不回传步数，腕上用不确定进度展示
             )
             _tasks.update { listOf(task) + it }
+            // 先起轮询：云端一开始执行就能看到 RUNNING，不必等 HTTP 返回
             startPolling(conversation.id)
+            // 关键：create 里的 prompt 只截前 100 字用来生成会话标题，不会真正执行。
+            // 首轮指令必须通过 ACP session/prompt 下发，否则只会留下一个空会话。
+            //
+            // session/prompt 的 HTTP 响应要等整个回合跑完才返回，云端思考几分钟就会把
+            // 连接读超时。指令在写出请求体时就已经送达，所以这里不等待响应：
+            // 后台发出、忽略超时，进度交给上面的轮询。
+            deliver(conversation.id) { client.sendPrompt(session, prompt, attachments) }
             conversation.id
         }
 
     override suspend fun reply(id: String, prompt: String) = withContext(Dispatchers.IO) {
-        client.sendPrompt(sessionOf(id), prompt)
         updateTask(id) { it.copy(status = TaskStatus.WORKING, error = null, ask = null) }
         startPolling(id)
+        deliver(id) { client.sendPrompt(sessionOf(id), prompt) }
     }
 
     /**
@@ -81,15 +86,17 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
      */
     override suspend fun answerAsk(id: String, answer: String) = withContext(Dispatchers.IO) {
         val task = _tasks.value.firstOrNull { it.id == id } ?: return@withContext
-        val session = sessionOf(id)
         val ask = task.ask
-        if (ask?.requestId != null) {
-            client.resolveInterruption(session, ask, answer)
-        } else {
-            client.sendPrompt(session, answer)
-        }
         updateTask(id) { it.copy(status = TaskStatus.WORKING, ask = null, unread = false, error = null) }
         startPolling(id)
+        deliver(id) {
+            val session = sessionOf(id)
+            if (ask?.requestId != null) {
+                client.resolveInterruption(session, ask, answer)
+            } else {
+                client.sendPrompt(session, answer)
+            }
+        }
     }
 
     override suspend fun uploadAttachment(name: String, mimeType: String, bytes: ByteArray): Artifact =
@@ -116,10 +123,9 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
 
     override suspend fun retry(id: String) = withContext(Dispatchers.IO) {
         val prompt = _tasks.value.firstOrNull { it.id == id }?.title.orEmpty()
-        if (sessionOf(id).let { runCatching { client.sendPrompt(it, prompt) }.isSuccess }) {
-            updateTask(id) { it.copy(status = TaskStatus.WORKING, error = null) }
-            startPolling(id)
-        }
+        updateTask(id) { it.copy(status = TaskStatus.WORKING, error = null) }
+        startPolling(id)
+        deliver(id) { client.sendPrompt(sessionOf(id), prompt) }
     }
 
     override fun markRead(id: String) {
@@ -142,6 +148,27 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
 
     private fun sessionOf(id: String): WorkBuddyCloudClient.Session =
         sessions[id] ?: client.fetchSession(id).also { sessions[id] = it }
+
+    /**
+     * 后台下发指令：界面不等 HTTP 响应，超时也不算失败。
+     *
+     * `session/prompt` 的响应要等云端把整个回合跑完才返回，思考几分钟就必然触发读超时。
+     * 但请求体写出时指令已经送达，云端会继续执行，所以这里只负责「送出去」，
+     * 之后的进度由 [startPolling] 轮询反映。
+     */
+    private fun deliver(id: String, call: () -> Unit) {
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) { call() }
+            } catch (_: java.net.SocketTimeoutException) {
+                // 云端仍在执行，属于正常情况
+            } catch (e: Exception) {
+                updateTask(id) {
+                    it.copy(error = "指令下发失败：" + (e.message ?: e.javaClass.simpleName).take(60))
+                }
+            }
+        }
+    }
 
     private suspend fun refreshList() {
         runCatching { client.listConversations() }

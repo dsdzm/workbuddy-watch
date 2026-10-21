@@ -7,8 +7,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.calculateStartPadding
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
@@ -20,7 +21,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
@@ -51,7 +51,6 @@ fun WatchPage(
     content: ScalingLazyListScope.() -> Unit
 ) {
     val listState = rememberScalingLazyListState()
-    val layoutDirection = LocalLayoutDirection.current
     ScreenScaffold(
         scrollState = listState,
         scrollIndicator = if (scrollIndicator) {
@@ -60,24 +59,42 @@ fun WatchPage(
             null
         }
     ) { padding ->
-        val horizontal =
-            if (roundScreen) padding.calculateStartPadding(layoutDirection) else 6.dp
-        ScalingLazyColumn(
+        // 圆屏把列表宽度收到内切正方形附近：ScalingLazyColumn 虽然会给边缘条目缩放，
+        // 但缩放后的宽度仍可能超出圆弧，长文本就会在左右两侧被表盘裁掉。
+        val listModifier = if (roundScreen) {
+            Modifier
+                .fillMaxHeight()
+                .fillMaxWidth(CIRCLE_SAFE_WIDTH)
+        } else {
+            Modifier.fillMaxSize()
+        }
+        Box(
             modifier = Modifier.fillMaxSize(),
-            state = listState,
-            contentPadding = PaddingValues(
-                start = horizontal,
-                end = horizontal,
-                top = padding.calculateTopPadding(),
-                bottom = padding.calculateBottomPadding() + bottomInset
-            ),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            contentAlignment = Alignment.Center
         ) {
-            content()
+            ScalingLazyColumn(
+                modifier = listModifier,
+                state = listState,
+                contentPadding = PaddingValues(
+                    start = if (roundScreen) 0.dp else 6.dp,
+                    end = if (roundScreen) 0.dp else 6.dp,
+                    top = padding.calculateTopPadding(),
+                    bottom = padding.calculateBottomPadding() + bottomInset
+                ),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                content()
+            }
         }
     }
 }
+
+/**
+ * 圆屏可用内容宽度系数：屏幕内切正方形约为 1/√2 ≈ 0.707，
+ * 再留一点余量，保证滚动到任意位置时文字都不会被圆弧切掉。
+ */
+private const val CIRCLE_SAFE_WIDTH = 0.72f
 
 /**
  * 表单 / 输入型页面的骨架：普通 `Column` + `verticalScroll`。
@@ -91,16 +108,23 @@ fun WatchColumn(
     modifier: Modifier = Modifier,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    Column(
-        modifier = modifier
+    Box(
+        modifier = Modifier
             .fillMaxSize()
-            .safeDrawingPadding()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = if (roundScreen) 16.dp else 6.dp)
-            .padding(top = 26.dp, bottom = 10.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-        content = content
-    )
+            .safeDrawingPadding(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = modifier
+                .fillMaxHeight()
+                .fillMaxWidth(if (roundScreen) CIRCLE_SAFE_WIDTH else 1f)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = if (roundScreen) 0.dp else 6.dp)
+                .padding(top = 26.dp, bottom = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            content = content
+        )
+    }
 }
 
 /**

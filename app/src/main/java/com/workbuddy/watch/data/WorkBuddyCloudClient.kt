@@ -246,7 +246,9 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             .put("cwd", session.cwd.orEmpty())
             .put("mcpServers", JSONArray())
             .put("prompt", blocks)
-        acpCall(session, ACP_PROMPT, params)
+        // prompt 的响应要等云端整个回合结束，用短超时把调用方尽快放回；
+        // 指令已经随请求体送达，断开后云端仍会继续执行。
+        acpCall(session, ACP_PROMPT, params, timeoutMs = PROMPT_READ_TIMEOUT)
     }
 
     /** 中断当前执行（非退出排队）。 */
@@ -275,13 +277,23 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
      * 拉取账号积分：资源包明细 + 今日请求次数。
      *
      * 端点取自 web 端「套餐与积分」页（`/profile/plans-usage`）。
-     * 不同接口的资源包列表位置不一致（`data.Accounts` / `data.Response.Data.Accounts`），
-     * 字段大小写也不统一，因此这里递归找数组、按多个候选键取值。
+     *
+     * 主数据源用 `get-user-resource-summary`：它不要求 `PackageCodes`，直接返回
+     * `Packages[].CycleTotalCapacity / CycleRemainCapacity / CycleUsedCapacity`，
+     * 结构稳定。明细接口（`get-user-resource*`）必须带上整串包码与 `Status: [0, 3]`
+     * 才有结果，漏传就是空列表 —— 之前的「字段无法识别」就是这样来的。
      */
     fun fetchUsage(): UsageSnapshot {
-        val accounts = mutableListOf<JSONObject>()
+        val summary = runCatching {
+            callEnvelope("POST", "/billing/meter/get-user-resource-summary", JSONObject())
+        }.getOrNull()
+        val fromSummary = summary?.let { packsOfSummary(it) }.orEmpty()
+        if (fromSummary.isNotEmpty()) {
+            return UsageSnapshot(packs = fromSummary, todayRequests = runCatching { todayRequests() }.getOrNull())
+        }
 
-        // 主接口：账号下全部资源包（免费 + 付费）
+        val accounts = mutableListOf<JSONObject>()
+        // 兜底：账号下全部资源包
         runCatching {
             val data = callEnvelope(
                 "POST", "/billing/meter/get-user-resource",
@@ -289,12 +301,15 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             )
             accounts += accountsOf(data)
         }
-        // 兜底：主接口结构变了就改用已购包列表
         if (accounts.isEmpty()) {
             runCatching {
                 val data = callEnvelope(
                     "POST", "/billing/meter/get-user-resource-paid-packages",
-                    JSONObject().put("PageNumber", 1).put("PageSize", USAGE_PACK_LIMIT)
+                    JSONObject()
+                        .put("PageNumber", 1)
+                        .put("PageSize", USAGE_PACK_LIMIT)
+                        .put("PackageCodes", JSONArray(PAID_PACKAGE_CODES))
+                        .put("Status", JSONArray(listOf(0, 3)))
                 )
                 accounts += accountsOf(data)
             }
@@ -302,13 +317,11 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         if (accounts.isEmpty()) throw IllegalStateException("积分接口未返回资源包")
 
         val packs = accounts.distinctBy { it.toString() }.mapNotNull { o ->
-            val total = numberOf(o, "Total", "total", "Capacity", "capacity")
-            val left = numberOf(o, "left", "Left", "Remain", "Remaining", "remain", "Balance")
+            val total = numberOf(o, "Total", "total", "TotalCapacity", "Capacity", "capacity")
+            val left = numberOf(o, "left", "Left", "RemainCapacity", "Remain", "Remaining", "remain", "Balance")
             if (total == null && left == null) return@mapNotNull null
             UsagePack(
-                name = o.optString("PackageName").ifBlank {
-                    o.optString("PackageCode").ifBlank { "积分包" }
-                },
+                name = o.optString("PackageName").ifBlank { packageLabel(o.optString("PackageCode")) },
                 total = total ?: 0.0,
                 left = left ?: 0.0,
                 status = o.optString("Status").takeIf { it.isNotBlank() },
@@ -320,6 +333,37 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
 
         // 今日用量失败不影响余额展示
         return UsageSnapshot(packs = packs, todayRequests = runCatching { todayRequests() }.getOrNull())
+    }
+
+    /** 解析 summary 的 `Packages[]`；容量字段是 Cycle*Capacity 三件套。 */
+    private fun packsOfSummary(data: JSONObject): List<UsagePack> {
+        val arr = data.optJSONArray("Packages") ?: data.optJSONArray("packages") ?: return emptyList()
+        val subscription = data.optString("SubscriptionPackageName")
+        return (0 until arr.length()).mapNotNull { i ->
+            val o = arr.optJSONObject(i) ?: return@mapNotNull null
+            val total = numberOf(o, "CycleTotalCapacity", "TotalCapacity")
+            val left = numberOf(o, "CycleRemainCapacity", "RemainCapacity")
+            val used = numberOf(o, "CycleUsedCapacity", "UsedCapacity")
+            if (total == null && left == null) return@mapNotNull null
+            val code = o.optString("PackageCode")
+            UsagePack(
+                name = subscription.ifBlank { packageLabel(code) },
+                total = total ?: ((left ?: 0.0) + (used ?: 0.0)),
+                left = left ?: ((total ?: 0.0) - (used ?: 0.0))
+            )
+        }
+    }
+
+    /** 包码 → 可读名称。包码形如 `TCACA_code_001_PqouKr6QWV`，末段是随机串。 */
+    private fun packageLabel(code: String): String {
+        val number = Regex("""code_(\d{3})""").find(code)?.groupValues?.get(1)
+        return when (number) {
+            "001" -> "免费额度"
+            "002", "003", "004" -> "专业版"
+            "006" -> "赠送积分"
+            "039", "040" -> "试用额度"
+            else -> if (number != null) "积分包 $number" else "积分包"
+        }
     }
 
     /** 今日请求次数：优先取信封里的 `total`，否则数列表长度。 */
@@ -533,7 +577,12 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
      * ACP 调用。协议要求先建流拿到 `Acp-Connection-Id`（可能还带 `acp-session-token`），
      * 再用同一 ID 发起 JSON-RPC POST；因此这里保持 GET 连接打开直到 POST 完成。
      */
-    private fun acpCall(session: Session, method: String, params: JSONObject) {
+    private fun acpCall(
+        session: Session,
+        method: String,
+        params: JSONObject,
+        timeoutMs: Int = READ_TIMEOUT
+    ) {
         val url = normalizeLink(session.link)
         val stream = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
@@ -548,7 +597,7 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             val connectionId = stream.getHeaderField(ACP_CONNECTION_HEADER)
                 ?: throw IllegalStateException("ACP 握手失败：缺少 $ACP_CONNECTION_HEADER")
             val acpSessionToken = stream.getHeaderField(ACP_SESSION_TOKEN_HEADER)?.trim().orEmpty()
-            postRpc(url, session.token, connectionId, acpSessionToken, method, params)
+            postRpc(url, session.token, connectionId, acpSessionToken, method, params, timeoutMs)
         } finally {
             runCatching { stream.disconnect() }
         }
@@ -732,9 +781,29 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         /** 新建会话时的默认模型（web 端同款默认值）。 */
         const val DEFAULT_MODEL = "deepseek-r1"
 
+        /**
+         * 资源包明细接口必须显式传包码，否则返回空列表。
+         * 取自 web 端 `BackendProvider` 里的包码常量（免费 / 专业 / 赠送 / 试用）。
+         */
+        private val PAID_PACKAGE_CODES = listOf(
+            "TCACA_code_001_PqouKr6QWV", // free
+            "TCACA_code_002_AkiJS3ZHF5", // proMon
+            "TCACA_code_006_DbXS0lrypC", // gift
+            "TCACA_code_029_6wCGEWquYy", // bonus29
+            "TCACA_code_030_BjSt89qTvr", // bonus30
+            "TCACA_code_035_ArVxJcGDsm", // freeMonIntl
+            "TCACA_code_036_lupO5WgNdG", // extraIntl
+            "TCACA_code_037_WxOD3MpI2o", // bonusIntl
+            "TCACA_code_038_OhvqZtiPKr", // extra38
+            "TCACA_code_039_KRcQj7wUat", // proTrialMon
+            "TCACA_code_040_mi9rCYg46x"  // proTrialYear
+        )
+
         private const val TITLE_LIMIT = 100
         private const val CONNECT_TIMEOUT = 8_000
         private const val READ_TIMEOUT = 15_000
+        /** prompt 的响应要等整个回合，故意压低：指令已送出，界面不该陪着等。 */
+        private const val PROMPT_READ_TIMEOUT = 25_000
         /** 上传 / 下载产物文件时允许更长的读写时间。 */
         private const val TRANSFER_TIMEOUT = 60_000
         private const val HANDSHAKE_READ_TIMEOUT = 20_000

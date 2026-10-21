@@ -10,6 +10,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.workbuddy.watch.data.Artifact
 import com.workbuddy.watch.data.ChatMessage
+import com.workbuddy.watch.data.ChatRole
 import com.workbuddy.watch.data.CloudSettings
 import com.workbuddy.watch.data.CloudTaskRepository
 import com.workbuddy.watch.data.ExecEnv
@@ -97,6 +98,8 @@ data class WatchUiState(
     val historyTitle: String = "",
     val historyLoading: Boolean = false,
     val historyError: String? = null,
+    /** 历史对话页正在等云端回复（已发出追问，尚未拿到新消息）。 */
+    val historyBusy: Boolean = false,
     /** 积分用量：登录后从 `/billing/meter` 接口拉取。 */
     val usage: UsageSnapshot? = null,
     val usageLoading: Boolean = false,
@@ -536,6 +539,42 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
     fun closeHistory() =
         _ui.update { it.copy(screen = Screen.LIST, history = emptyList(), historyError = null) }
 
+    /**
+     * 在历史对话页里继续追问。
+     *
+     * 先把用户消息乐观插入列表让界面立刻有反馈，再交给 [CloudTaskRepository.reply]
+     * 后台下发；云端不回推事件，因此按固定间隔回拉 `session/load` 直到出现新消息。
+     */
+    fun sendHistoryMessage() {
+        val text = _ui.value.draft.trim()
+        val id = _ui.value.activeTaskId ?: return
+        if (text.isBlank() || _ui.value.historyBusy) return
+
+        val baseline = _ui.value.history.size
+        _ui.update {
+            it.copy(
+                draft = "",
+                historyBusy = true,
+                historyError = null,
+                history = it.history + ChatMessage(ChatRole.USER, text)
+            )
+        }
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { runCatching { repo.reply(id, text) } }
+            repeat(HISTORY_POLL_TIMES) {
+                delay(HISTORY_POLL_INTERVAL)
+                val messages = withContext(Dispatchers.IO) {
+                    runCatching { repo.loadHistory(id) }.getOrNull()
+                }
+                if (messages != null && messages.size > baseline) {
+                    _ui.update { it.copy(history = messages, historyBusy = false) }
+                    return@launch
+                }
+            }
+            _ui.update { it.copy(historyBusy = false) }
+        }
+    }
+
     // ---------- 模型选择 ----------
 
     /** 打开模型选择页并拉取云端可选模型。 */
@@ -577,6 +616,13 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
     private fun modelToast(id: String): String =
         if (id.isBlank()) "已使用云端默认模型"
         else "已切换到 " + (_ui.value.models.firstOrNull { it.id == id }?.name ?: id)
+
+    /** 对话页内切换模型：只持久化，不改变当前页面。 */
+    fun chooseModelInline(id: String) {
+        settings.selectedModel = id
+        _ui.update { it.copy(selectedModel = id, toast = modelToast(id)) }
+        clearToastLater()
+    }
 
     /** 打开原生登录页（手机号 + 验证码）。 */
     fun openLogin() {
@@ -833,5 +879,11 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
         label.contains("文档处理") -> "整理并生成一份文档"
         label.contains("幻灯片") -> "生成一页演示文稿大纲"
         else -> "完成这件事"
+    }
+
+    private companion object {
+        /** 追问后回拉历史的最大次数与间隔：3 秒一次，约两分钟。 */
+        const val HISTORY_POLL_TIMES = 40
+        const val HISTORY_POLL_INTERVAL = 3_000L
     }
 }
