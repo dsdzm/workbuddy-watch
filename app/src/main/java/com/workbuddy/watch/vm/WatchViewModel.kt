@@ -93,6 +93,8 @@ data class WatchUiState(
     val models: List<RemoteModel> = emptyList(),
     val modelsLoading: Boolean = false,
     val modelsError: String? = null,
+    /** 模型选择页的返回目标：从首页进入回首页，从设置进入回设置。 */
+    val modelsReturnScreen: Screen = Screen.SETTINGS,
     /** 历史对话详情：完整消息与加载态。 */
     val history: List<ChatMessage> = emptyList(),
     val historyTitle: String = "",
@@ -577,13 +579,20 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- 模型选择 ----------
 
-    /** 打开模型选择页并拉取云端可选模型。 */
-    fun openModels() {
-        _ui.update { it.copy(screen = Screen.MODELS, modelsLoading = true, modelsError = null) }
+    /** 打开模型选择页并拉取云端可选模型，[from] 决定返回时回到哪一页。 */
+    fun openModels(from: Screen = Screen.SETTINGS) {
+        _ui.update {
+            it.copy(
+                screen = Screen.MODELS,
+                modelsReturnScreen = from,
+                modelsLoading = true,
+                modelsError = null
+            )
+        }
         loadModels()
     }
 
-    fun closeModels() = _ui.update { it.copy(screen = Screen.SETTINGS) }
+    fun closeModels() = _ui.update { it.copy(screen = it.modelsReturnScreen) }
 
     fun loadModels() {
         _ui.update { it.copy(modelsLoading = true, modelsError = null) }
@@ -605,10 +614,12 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 选中模型：持久化并回到设置页。空 ID 表示用云端默认模型。 */
+    /** 选中模型：持久化并回到进入前的页面。空 ID 表示用云端默认模型。 */
     fun chooseModel(id: String) {
         settings.selectedModel = id
-        _ui.update { it.copy(selectedModel = id, screen = Screen.SETTINGS, toast = modelToast(id)) }
+        _ui.update {
+            it.copy(selectedModel = id, screen = it.modelsReturnScreen, toast = modelToast(id))
+        }
         clearToastLater()
     }
 

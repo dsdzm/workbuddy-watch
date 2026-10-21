@@ -390,7 +390,6 @@ fun SettingsScreen(
     onLogout: () -> Unit,
     onToggleShape: () -> Unit,
     onModels: () -> Unit,
-    onAbout: () -> Unit,
     onCheckEnv: () -> Unit,
     onBack: () -> Unit,
     version: String = BuildConfig.VERSION_NAME
@@ -466,14 +465,6 @@ fun SettingsScreen(
             }
         }
 
-        item {
-            PillRow(
-                title = "关于 WorkBuddy",
-                subtitle = "版本与开源信息",
-                leadingIcon = Icons.Filled.Info,
-                onClick = onAbout
-            )
-        }
         item { VersionFooter("WorkBuddy Watch v$version") }
     }
 }

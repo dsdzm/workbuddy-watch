@@ -1,5 +1,11 @@
 package com.workbuddy.watch.ui.screens
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Cloud
@@ -11,6 +17,11 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.unit.dp
+import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.Text
 import com.workbuddy.watch.data.Artifact
 import com.workbuddy.watch.data.Task
@@ -44,6 +55,7 @@ fun HomeScreen(
     unreadCount: Int,
     attachments: List<Artifact>,
     uploading: Boolean,
+    modelLabel: String,
     onScene: (String) -> Unit,
     onCompose: () -> Unit,
     onPickFile: () -> Unit,
@@ -52,6 +64,7 @@ fun HomeScreen(
     onUsage: () -> Unit,
     onSettings: () -> Unit,
     onAbout: () -> Unit,
+    onModels: () -> Unit,
     onConn: () -> Unit,
     onLogin: () -> Unit,
     onOpenTask: (String) -> Unit
@@ -65,10 +78,12 @@ fun HomeScreen(
                 loggedIn = loggedIn,
                 workingTask = workingTask,
                 attachments = attachments,
+                modelLabel = modelLabel,
                 onScene = onScene,
                 onCompose = onCompose,
                 onRemoveAttachment = onRemoveAttachment,
                 onLogin = onLogin,
+                onModels = onModels,
                 onOpenTask = onOpenTask
             )
         } else {
@@ -99,14 +114,18 @@ private fun TaskPage(
     loggedIn: Boolean,
     workingTask: Task?,
     attachments: List<Artifact>,
+    modelLabel: String,
     onScene: (String) -> Unit,
     onCompose: () -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onLogin: () -> Unit,
+    onModels: () -> Unit,
     onOpenTask: (String) -> Unit
 ) {
     WatchPage(roundScreen = roundScreen, scrollIndicator = false, bottomInset = PAGER_DOTS_INSET) {
         item { CenteredHeader("WorkBuddy", "手腕上的 AI 工作搭子") }
+        // 模型选择：下达任务前就能看到并切换，位置对齐参考图顶部的模型 chip
+        item { ModelChip(modelLabel, onModels) }
         item {
             PillInput(
                 hint = "输入任务…",
@@ -238,6 +257,26 @@ private fun MenuPage(
                 title = "关于",
                 leadingIcon = Icons.Filled.Info,
                 onClick = onAbout
+            )
+        }
+    }
+}
+
+/** 模型 chip：显示当前模型，点击进入模型选择页。 */
+@Composable
+private fun ModelChip(label: String, onClick: () -> Unit) {
+    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+        Box(
+            modifier = Modifier
+                .clip(CircleShape)
+                .background(WatchPalette.PillDim)
+                .clickable(onClick = onClick)
+                .padding(horizontal = 14.dp, vertical = 6.dp)
+        ) {
+            Text(
+                text = "模型 · $label",
+                style = MaterialTheme.typography.labelSmall,
+                color = WatchPalette.Accent
             )
         }
     }
