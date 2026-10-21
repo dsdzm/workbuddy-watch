@@ -139,11 +139,14 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         return (0 until array.length()).mapNotNull { i ->
             val o = array.optJSONObject(i) ?: return@mapNotNull null
             if (o.optBoolean("disabled")) return@mapNotNull null
-            val id = o.optString("id").ifBlank { o.optString("model") }
-            if (id.isBlank()) return@mapNotNull null
+            // 云端要的是 `model`（真正的模型标识，如 deepseek-v4.1-flash / hy4-preview）；
+            // `id` 只是目录项 ID，直接当模型发会 400 `service info not found`
+            val modelId = o.optString("model").ifBlank { o.optString("id") }
+            if (modelId.isBlank()) return@mapNotNull null
             RemoteModel(
-                id = id,
-                name = o.optString("name").takeIf { it.isNotBlank() } ?: id,
+                id = modelId,
+                name = o.optString("name").ifBlank { o.optString("displayName") }
+                    .takeIf { it.isNotBlank() } ?: modelId,
                 isDefault = o.optBoolean("isDefault"),
                 description = o.optString("descriptionZh")
                     .takeIf { it.isNotBlank() } ?: o.optString("description").takeIf { it.isNotBlank() }
@@ -235,7 +238,81 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         }
     }
 
-    // ---------- ACP：下发 / 追问 / 中断 ----------
+    /**
+     * 取某个会话**真正可用**的模型清单（ACP 侧返回的 `availableModels`）。
+     *
+     * console 的 `/models` 是模型目录，会把账号没有开通的模型也列出来（例如
+     * `hunyuan-2.0-thinking`），拿它去 `session/set_model` 会被云端回
+     * `400 model [...] service info not found`。网页端的做法是取这两者的交集：
+     * `models.filter(m => availableModels.includes(m.id))`，这里照做。
+     *
+     * 数据来源是 `session/load` 的 JSON-RPC 响应：
+     * `result.models._meta["codebuddy.ai"].availableModels`（也兼容 `result.models.availableModels`）。
+     */
+    fun fetchAvailableModels(session: Session, timeoutMs: Long = MODELS_TIMEOUT): Set<String> {
+        val url = normalizeLink(session.link)
+        val stream = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = CONNECT_TIMEOUT
+            readTimeout = (timeoutMs + 2000L).toInt()
+            setRequestProperty("Authorization", "Bearer ${session.token}")
+            setRequestProperty("User-Agent", settings.userAgent)
+            setRequestProperty("Accept", "text/event-stream")
+        }
+        return try {
+            stream.responseCode
+            val connectionId = stream.getHeaderField(ACP_CONNECTION_HEADER) ?: return emptySet()
+            val acpSessionToken = stream.getHeaderField(ACP_SESSION_TOKEN_HEADER)?.trim().orEmpty()
+            val params = JSONObject()
+                .put("sessionId", session.conversationId)
+                .put("cwd", session.cwd.orEmpty())
+                .put("mcpServers", JSONArray())
+            Thread {
+                runCatching {
+                    postRpc(
+                        url = url,
+                        token = session.token,
+                        connectionId = connectionId,
+                        acpSessionToken = acpSessionToken,
+                        method = ACP_LOAD,
+                        params = params,
+                        readTimeout = timeoutMs.toInt()
+                    )
+                }
+            }.apply { isDaemon = true; start() }
+
+            val deadline = System.currentTimeMillis() + timeoutMs
+            val reader = BufferedReader(InputStreamReader(stream.inputStream, Charsets.UTF_8))
+            while (System.currentTimeMillis() < deadline) {
+                val line = runCatching { reader.readLine() }.getOrNull() ?: break
+                if (!line.startsWith("data:")) continue
+                val payload = runCatching { JSONObject(line.removePrefix("data:").trim()) }.getOrNull()
+                    ?: continue
+                val ids = availableModelIds(payload.optJSONObject("result"))
+                if (ids.isNotEmpty()) return ids
+            }
+            emptySet()
+        } catch (_: Exception) {
+            emptySet()
+        } finally {
+            runCatching { stream.disconnect() }
+        }
+    }
+
+    /** 从 `session/load` 的 result 里拆出可用模型 ID 集合。 */
+    private fun availableModelIds(result: JSONObject?): Set<String> {
+        val models = result?.optJSONObject("models") ?: return emptySet()
+        val meta = models.optJSONObject("_meta")?.optJSONObject("codebuddy.ai")
+        val array = meta?.optJSONArray("availableModels")
+            ?: models.optJSONArray("availableModels")
+            ?: return emptySet()
+        return (0 until array.length()).mapNotNull { i ->
+            when (val item = array.opt(i)) {
+                is JSONObject -> item.optString("id").ifBlank { item.optString("model") }
+                else -> item?.toString().orEmpty()
+            }.takeIf { it.isNotBlank() }
+        }.toSet()
+    }
 
     /**
      * 下发或追问。
@@ -942,7 +1019,13 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
 
     companion object {
         /** 新建会话时的默认模型（web 端同款默认值）。 */
-        const val DEFAULT_MODEL = "deepseek-r1"
+        /**
+         * 兜底模型：账号没有显式选择时使用。
+         *
+         * 必须落在账号实际支持的清单里（云端对未知模型直接 400 `service info not found`），
+         * 旧值 `deepseek-r1` 已下线，改用官方端默认的 hy4-preview。
+         */
+        const val DEFAULT_MODEL = "hy4-preview"
 
         /**
          * 资源包明细接口必须显式传包码，否则返回空列表。
@@ -979,6 +1062,8 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         private const val MAX_INLINE_IMAGE = 8 * 1024 * 1024
         /** 上传缓存保留的份数。 */
         private const val MAX_CACHED_UPLOADS = 4
+        /** 拉取会话可用模型清单（session/load 响应）的最长等待。 */
+        private const val MODELS_TIMEOUT = 8_000L
 
         /** 网关判定未登录；此时尝试用 Keycloak SSO cookie 静默续期。 */
         private const val HTTP_UNAUTHORIZED = 401

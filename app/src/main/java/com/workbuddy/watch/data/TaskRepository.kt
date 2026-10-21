@@ -11,6 +11,9 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.UUID
 
+/** 没有模型错误的数据源共用的空流。 */
+private val NEVER_ERROR: StateFlow<String?> = MutableStateFlow<String?>(null).asStateFlow()
+
 /**
  * 任务数据源。手表可脱离手机，独立对接 WorkBuddy 云端（见 [CloudTaskRepository]）。
  * 未配置主端时回退到 [FakeTaskRepository] 以便演示与离线自检。
@@ -27,6 +30,12 @@ interface TaskRepository {
      * 界面据此回到「可重新登录」的状态，而不是停在一条永远发不出去任务的 401 上。
      */
     val sessionExpired: StateFlow<Boolean>
+
+    /** 模型设置失败原因（例如账号没开通所选模型）；null 表示正常。 */
+    val modelError: StateFlow<String?> get() = NEVER_ERROR
+
+    /** 提示过一次后清空，避免重复弹同一条。 */
+    fun clearModelError() {}
 
     /** 下达任务；[attachments] 为已上传到云端的附件引用（云端会随 prompt 一并下发）。 */
     suspend fun dispatch(prompt: String, env: ExecEnv, attachments: List<Artifact> = emptyList()): String
@@ -75,7 +84,6 @@ interface TaskRepository {
 
 /** 本地演示实现（无主端时使用）。 */
 class FakeTaskRepository : TaskRepository {
-
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val jobs = mutableMapOf<String, kotlinx.coroutines.Job>()
 

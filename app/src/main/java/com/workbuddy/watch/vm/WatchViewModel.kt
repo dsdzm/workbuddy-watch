@@ -152,6 +152,7 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
     private var connectedJob: Job? = null
     private var cloudErrorJob: Job? = null
     private var sessionExpiredJob: Job? = null
+    private var modelErrorJob: Job? = null
     private var tasksJob: Job? = null
     private var countdownJob: Job? = null
     /** 本次登录流程（发码 → 提交）必须共用同一个 Keycloak 会话，故持有同一实例。 */
@@ -175,6 +176,7 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
         tasksJob?.cancel()
         cloudErrorJob?.cancel()
         sessionExpiredJob?.cancel()
+        modelErrorJob?.cancel()
         prevStatus = emptyMap()
         // 重建仓库后把当前的前后台状态补回去，避免刚创建时误判为前台
         repo.setForeground(foregroundNow)
@@ -186,6 +188,15 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
         }
         sessionExpiredJob = viewModelScope.launch {
             repo.sessionExpired.collect { expired -> if (expired) onSessionExpired() }
+        }
+        // 模型没开通时云端会 400：不提示的话用户只看到「选了不生效」
+        modelErrorJob = viewModelScope.launch {
+            repo.modelError.collect { msg ->
+                if (!msg.isNullOrBlank()) {
+                    showToast(msg)
+                    repo.clearModelError()
+                }
+            }
         }
         tasksJob = viewModelScope.launch {
             repo.tasks.collect { list -> handleTasks(list) }
@@ -630,6 +641,12 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
             val result = withContext(Dispatchers.IO) { runCatching { repo.listModels() } }
             result
                 .onSuccess { list ->
+                    // 已选模型不在账号可用范围内时回退：否则下发会 400 service info not found
+                    if (list.isNotEmpty() && list.none { it.id == settings.selectedModel }) {
+                        settings.selectedModel = list
+                            .firstOrNull { it.id == WorkBuddyCloudClient.DEFAULT_MODEL }?.id
+                            ?: list.first().id
+                    }
                     _ui.update {
                         it.copy(
                             models = list,
