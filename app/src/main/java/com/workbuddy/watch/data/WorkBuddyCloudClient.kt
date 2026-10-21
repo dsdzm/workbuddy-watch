@@ -227,8 +227,17 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
     /**
      * 下发或追问。[attachments] 会作为 ACP `resource_link` 内容块一并发送，
      * 让云端沙箱能直接读取这些已上传的文件。
+     *
+     * [modelId] 非空时，在同一条 ACP 连接上先发一次 `session/set_model`。
+     * 建会话接口里的 `model` 只写进会话元信息，真正执行用的模型由 ACP 决定，
+     * 不补这一步就会出现「界面选了 DeepSeek、实际跑的是账号默认模型」。
      */
-    fun sendPrompt(session: Session, text: String, attachments: List<Artifact> = emptyList()) {
+    fun sendPrompt(
+        session: Session,
+        text: String,
+        attachments: List<Artifact> = emptyList(),
+        modelId: String? = null
+    ) {
         val blocks = JSONArray()
         if (text.isNotBlank()) blocks.put(JSONObject().put("type", "text").put("text", text))
         attachments.forEach { a ->
@@ -246,9 +255,16 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             .put("cwd", session.cwd.orEmpty())
             .put("mcpServers", JSONArray())
             .put("prompt", blocks)
+        val prelude = modelId?.trim()?.takeIf { it.isNotBlank() }?.let { id ->
+            listOf(
+                ACP_SET_MODEL to JSONObject()
+                    .put("sessionId", session.conversationId)
+                    .put("modelId", id)
+            )
+        }.orEmpty()
         // prompt 的响应要等云端整个回合结束，用短超时把调用方尽快放回；
         // 指令已经随请求体送达，断开后云端仍会继续执行。
-        acpCall(session, ACP_PROMPT, params, timeoutMs = PROMPT_READ_TIMEOUT)
+        acpCall(session, ACP_PROMPT, params, timeoutMs = PROMPT_READ_TIMEOUT, prelude = prelude)
     }
 
     /** 中断当前执行（非退出排队）。 */
@@ -579,7 +595,8 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         session: Session,
         method: String,
         params: JSONObject,
-        timeoutMs: Int = READ_TIMEOUT
+        timeoutMs: Int = READ_TIMEOUT,
+        prelude: List<Pair<String, JSONObject>> = emptyList()
     ) {
         val url = normalizeLink(session.link)
         val stream = (URL(url).openConnection() as HttpURLConnection).apply {
@@ -595,6 +612,10 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             val connectionId = stream.getHeaderField(ACP_CONNECTION_HEADER)
                 ?: throw IllegalStateException("ACP 握手失败：缺少 $ACP_CONNECTION_HEADER")
             val acpSessionToken = stream.getHeaderField(ACP_SESSION_TOKEN_HEADER)?.trim().orEmpty()
+            // 前置请求（如 session/set_model）尽力而为：旧会话不支持时不该拦住真正的下发
+            prelude.forEach { (m, p) ->
+                runCatching { postRpc(url, session.token, connectionId, acpSessionToken, m, p) }
+            }
             postRpc(url, session.token, connectionId, acpSessionToken, method, params, timeoutMs)
         } finally {
             runCatching { stream.disconnect() }
@@ -820,6 +841,10 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         private const val ACP_SESSION_TOKEN_HEADER = "acp-session-token"
         private const val ACP_PROMPT = "session/prompt"
         private const val ACP_CANCEL = "session/cancel"
+
+        /** ACP 扩展方法：设定本会话实际使用的大模型（`{sessionId, modelId}`）。 */
+        private const val ACP_SET_MODEL = "session/set_model"
+
         /** ACP 扩展方法：把整段会话历史回放到同一条 SSE 流上（网页端打开会话时也走它）。 */
         private const val ACP_LOAD = "session/load"
 

@@ -57,7 +57,7 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
     override suspend fun dispatch(prompt: String, env: ExecEnv, attachments: List<Artifact>): String =
         withContext(Dispatchers.IO) {
             // 用户在设置里选过模型就用选中的，否则回退 web 端同款默认模型
-            val model = settings.selectedModel.ifBlank { WorkBuddyCloudClient.DEFAULT_MODEL }
+            val model = currentModel()
             val conversation = client.createConversation(prompt, model)
             val session = conversation.session ?: client.fetchSession(conversation.id)
             sessions[conversation.id] = session
@@ -78,14 +78,14 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
             // session/prompt 的 HTTP 响应要等整个回合跑完才返回，云端思考几分钟就会把
             // 连接读超时。指令在写出请求体时就已经送达，所以这里不等待响应：
             // 后台发出、忽略超时，进度交给上面的轮询。
-            deliver(conversation.id) { client.sendPrompt(session, prompt, attachments) }
+            deliver(conversation.id) { client.sendPrompt(session, prompt, attachments, model) }
             conversation.id
         }
 
     override suspend fun reply(id: String, prompt: String) = withContext(Dispatchers.IO) {
         updateTask(id) { it.copy(status = TaskStatus.WORKING, error = null, ask = null) }
         startPolling(id)
-        deliver(id) { client.sendPrompt(sessionOf(id), prompt) }
+        deliver(id) { client.sendPrompt(sessionOf(id), prompt, emptyList(), currentModel()) }
     }
 
     /**
@@ -102,7 +102,7 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
             if (ask?.requestId != null) {
                 client.resolveInterruption(session, ask, answer)
             } else {
-                client.sendPrompt(session, answer)
+                client.sendPrompt(session, answer, emptyList(), currentModel())
             }
         }
     }
@@ -133,7 +133,7 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
         val prompt = _tasks.value.firstOrNull { it.id == id }?.title.orEmpty()
         updateTask(id) { it.copy(status = TaskStatus.WORKING, error = null) }
         startPolling(id)
-        deliver(id) { client.sendPrompt(sessionOf(id), prompt) }
+        deliver(id) { client.sendPrompt(sessionOf(id), prompt, emptyList(), currentModel()) }
     }
 
     override fun markRead(id: String) {
@@ -160,6 +160,10 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
 
     private fun sessionOf(id: String): WorkBuddyCloudClient.Session =
         sessions[id] ?: client.fetchSession(id).also { sessions[id] = it }
+
+    /** 当前选中的模型；没选过就用网页端同款默认模型。 */
+    private fun currentModel(): String =
+        settings.selectedModel.ifBlank { WorkBuddyCloudClient.DEFAULT_MODEL }
 
     /**
      * 后台下发指令：界面不等 HTTP 响应，超时也不算失败。
