@@ -532,18 +532,16 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
                 setRequestProperty("Content-Type", "application/json; charset=utf-8")
             }
         }
-        try {
-            if (body != null) conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-            val code = conn.responseCode
-            conn.headerFields?.let { settings.cookies.absorb(it, url) }
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val text = stream?.let { s ->
-                BufferedReader(InputStreamReader(s, Charsets.UTF_8)).use { it.readText() }
-            }
-            return HttpResult(code, text)
-        } finally {
-            conn.disconnect()
+        if (body != null) conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+        val code = conn.responseCode
+        conn.headerFields?.let { settings.cookies.absorb(it, url) }
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val text = stream?.let { s ->
+            BufferedReader(InputStreamReader(s, Charsets.UTF_8)).use { it.readText() }
         }
+        // 不调用 disconnect()：响应体已读到 EOF，连接会回到 keep-alive 池，
+        // 下一次同 host 的轮询直接复用这条 TCP/TLS 连接，省掉重复握手的几 KB。
+        return HttpResult(code, text)
     }
 
     /**

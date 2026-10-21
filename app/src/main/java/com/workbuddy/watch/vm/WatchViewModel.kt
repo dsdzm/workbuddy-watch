@@ -134,6 +134,9 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
     /** 已登录云端则直连，否则回退本地演示实现。 */
     private var repo: TaskRepository = buildRepo()
 
+    /** 最近一次前后台状态，重建仓库时补回给数据源。 */
+    private var foregroundNow = true
+
     private var prevStatus: Map<String, TaskStatus> = emptyMap()
     private var toastJob: Job? = null
     private var connectedJob: Job? = null
@@ -163,6 +166,8 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
         cloudErrorJob?.cancel()
         sessionExpiredJob?.cancel()
         prevStatus = emptyMap()
+        // 重建仓库后把当前的前后台状态补回去，避免刚创建时误判为前台
+        repo.setForeground(foregroundNow)
         connectedJob = viewModelScope.launch {
             repo.connected.collect { c -> _ui.update { it.copy(connected = c) } }
         }
@@ -621,6 +626,12 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
             it.copy(selectedModel = id, screen = it.modelsReturnScreen, toast = modelToast(id))
         }
         clearToastLater()
+    }
+
+    /** 界面在前台 / 息屏切换：数据源据此挂起或恢复轮询。 */
+    fun setForeground(foreground: Boolean) {
+        foregroundNow = foreground
+        repo.setForeground(foreground)
     }
 
     /** 切换模型后的提示文案：优先用清单里的模型名。 */

@@ -6,6 +6,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -45,14 +46,29 @@ import com.workbuddy.watch.vm.Screen
 import com.workbuddy.watch.vm.WatchViewModel
 
 class MainActivity : ComponentActivity() {
+
+    private val vm: WatchViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
             WorkBuddyWatchTheme {
-                WatchApp()
+                WatchApp(vm)
             }
         }
+    }
+
+    // 手表抬手亮屏 = ON_START，垂腕息屏 = ON_STOP。
+    // 息屏期间让数据源挂起所有轮询，亮屏后立刻补拉一次，这是最省流量的一档。
+    override fun onStart() {
+        super.onStart()
+        vm.setForeground(true)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        vm.setForeground(false)
     }
 }
 

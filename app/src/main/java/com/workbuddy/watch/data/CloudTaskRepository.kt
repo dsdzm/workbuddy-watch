@@ -9,10 +9,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 云端任务数据源：手表脱离手机，直接调用 WorkBuddy「云上模式」。
@@ -25,6 +27,12 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
     private val client = WorkBuddyCloudClient(settings)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val pollers = mutableMapOf<String, Job>()
+
+    /**
+     * 界面是否在前台（亮屏）。息屏时轮询协程挂在 [foregroundFlow] 上，一个请求都不发；
+     * 抬手亮屏立即通过，补拉一次最新的会话状态。
+     */
+    private val foregroundFlow = MutableStateFlow(true)
 
     /** 会话接入点缓存（link/token），供追问与中断复用，避免每次重复握手。 */
     private val sessions = mutableMapOf<String, WorkBuddyCloudClient.Session>()
@@ -144,6 +152,10 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
         scope.cancel()
     }
 
+    override fun setForeground(foreground: Boolean) {
+        foregroundFlow.value = foreground
+    }
+
     // ---------- 内部 ----------
 
     private fun sessionOf(id: String): WorkBuddyCloudClient.Session =
@@ -184,10 +196,15 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
 
     private suspend fun healthLoop() {
         while (scope.isActive) {
-            runCatching { client.listConversations(size = 1) }
-                .onSuccess { markHealthy() }
-                .onFailure { markUnhealthy(it) }
-            delay(20_000)
+            // 已连通时不做主动探测：任务轮询和页面操作本身就会刷新连接状态，
+            // 只有「还没连上」或「已掉线」才需要周期重试，避免息屏后还要一直发请求。
+            if (!_connected.value) {
+                foregroundFlow.first { it }
+                runCatching { client.listConversations(size = 1) }
+                    .onSuccess { markHealthy() }
+                    .onFailure { markUnhealthy(it) }
+            }
+            delay(HEALTH_INTERVAL)
         }
     }
 
@@ -212,12 +229,31 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
         }
     }
 
+    /**
+     * 任务进度轮询。
+     *
+     * 省流量两条规则：
+     * 1. 指数退避 2s → 30s。云端跑几分钟的任务，请求数从「每 2 秒一次」降到几次。
+     * 2. 息屏即挂起：整个协程停在 [foregroundFlow] 上，不发任何请求；
+     *    抬手亮屏立刻放行，补拉一次最新状态，进度感知没有损失。
+     */
     private fun startPolling(id: String) {
         pollers.remove(id)?.cancel()
         pollers[id] = scope.launch {
+            var backoff = INITIAL_POLL_INTERVAL
             while (isActive) {
-                delay(2000)
-                val remote = runCatching { client.getConversation(id) }.getOrNull() ?: continue
+                // 息屏：这里挂起，期间零请求
+                foregroundFlow.first { it }
+
+                // 退避等待；若中途息屏则直接进入下一轮（下一轮会挂起等待亮屏）
+                val wentBackground = withTimeoutOrNull(backoff) { foregroundFlow.first { !it } }
+                if (wentBackground != null) continue
+
+                val remote = runCatching { client.getConversation(id) }.getOrNull()
+                if (remote == null) {
+                    backoff = (backoff * 2).coerceAtMost(MAX_POLL_INTERVAL)
+                    continue
+                }
                 val status = remote.status.toTaskStatus()
                 if (status == TaskStatus.WORKING) remote.session?.let { sessions[id] = it }
                 updateTask(id) { t ->
@@ -233,6 +269,7 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
                     )
                 }
                 if (status.isTerminal()) return@launch
+                backoff = (backoff * 2).coerceAtMost(MAX_POLL_INTERVAL)
             }
         }
     }
@@ -299,5 +336,14 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
         "CANCELLED", "CANCELED" -> TaskStatus.STOPPED
         "EXPIRED", "FAILED", "ERROR" -> TaskStatus.FAILED
         else -> TaskStatus.WORKING
+    }
+
+    private companion object {
+        /** 首次轮询间隔，之后每次翻倍，最长 [MAX_POLL_INTERVAL]。 */
+        const val INITIAL_POLL_INTERVAL = 2_000L
+        const val MAX_POLL_INTERVAL = 30_000L
+
+        /** 只在掉线时才探测的间隔。 */
+        const val HEALTH_INTERVAL = 60_000L
     }
 }

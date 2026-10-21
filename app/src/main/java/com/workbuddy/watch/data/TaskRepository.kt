@@ -57,6 +57,14 @@ interface TaskRepository {
 
     /** 仅演示实现需要：模拟与主端断开 / 恢复。云端实现忽略此调用。 */
     fun setSimulatedOffline(value: Boolean) {}
+
+    /**
+     * 界面是否在前台（手表抬手亮屏）。
+     *
+     * 息屏时轮询完全挂起、不发任何请求；重新亮屏立即补拉一次，
+     * 用来把「省流量」做到不牺牲进度可见性。
+     */
+    fun setForeground(foreground: Boolean) {}
 }
 
 /** 本地演示实现（无主端时使用）。 */
