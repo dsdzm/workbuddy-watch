@@ -68,6 +68,16 @@ class CloudSettings(context: Context) {
         set(value) = prefs.edit().putString(KEY_ENTERPRISE, value.trim()).apply()
 
     /**
+     * 极致省流开关。
+     *
+     * 打开：息屏完全不轮询、退避拉长到 30s，最省流量但同步会明显滞后。
+     * 关闭（默认）：息屏也继续同步、退避上限 8s，换取消息更快到达。
+     */
+    var extremeSaver: Boolean
+        get() = prefs.getBoolean(KEY_EXTREME_SAVER, false)
+        set(value) = prefs.edit().putBoolean(KEY_EXTREME_SAVER, value).apply()
+
+    /**
      * 官方登录页地址。被测过能真正收到短信的**就是这一个**（见 [LOGIN_PLATFORM] / [LOGIN_REDIRECT_PATH]）：
      *
      *     {base}/login/?platform=agents&state=0&redirect_uri={base}/app
@@ -201,5 +211,6 @@ class CloudSettings(context: Context) {
         private const val KEY_SHAPE_CHOSEN = "shape_chosen"
         private const val KEY_MODEL = "selected_model"
         private const val KEY_ENTERPRISE = "enterprise_id"
+        private const val KEY_EXTREME_SAVER = "extreme_saver"
     }
 }

@@ -130,10 +130,18 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
      * 会话接入点优先复用轮询里已缓存的那份，没有就现取一次。
      */
     override suspend fun loadHistory(id: String): List<ChatMessage> =
-        withContext(Dispatchers.IO) { client.loadHistory(sessionOf(id)) }
+        withContext(Dispatchers.IO) { client.loadHistory(sessionOf(id)) }.dedupeMessages()
 
     override suspend fun listModels(): List<RemoteModel> =
         withContext(Dispatchers.IO) { client.listModels(settings.enterpriseId) }
+
+    override suspend fun remoteModel(id: String): String? =
+        withContext(Dispatchers.IO) { runCatching { client.getConversation(id)?.model }.getOrNull() }
+
+    override fun applyModelNow(id: String) {
+        // 用户在对话页刚切完模型就同步过去，下一次追问不用再等
+        scope.launch { runCatching { applyModel(id, sessionOf(id)) } }
+    }
 
     override fun stop(id: String) {
         pollers.remove(id)?.cancel()
@@ -286,26 +294,28 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
     /**
      * 任务进度轮询。
      *
-     * 省流量两条规则：
-     * 1. 指数退避 2s → 30s。云端跑几分钟的任务，请求数从「每 2 秒一次」降到几次。
-     * 2. 息屏即挂起：整个协程停在 [foregroundFlow] 上，不发任何请求；
-     *    抬手亮屏立刻放行，补拉一次最新状态，进度感知没有损失。
+     * 两种模式由「极致省流」开关决定：
+     * - 省流开：指数退避 2s → 30s，且息屏即挂起（整个协程停在 [foregroundFlow] 上），零流量。
+     * - 省流关（默认）：退避 2s → 8s，息屏也继续拉，消息到得更快。
      */
     private fun startPolling(id: String) {
         pollers.remove(id)?.cancel()
         pollers[id] = scope.launch {
             var backoff = INITIAL_POLL_INTERVAL
             while (isActive) {
-                // 息屏：这里挂起，期间零请求
-                foregroundFlow.first { it }
-
-                // 退避等待；若中途息屏则直接进入下一轮（下一轮会挂起等待亮屏）
-                val wentBackground = withTimeoutOrNull(backoff) { foregroundFlow.first { !it } }
-                if (wentBackground != null) continue
+                if (settings.extremeSaver) {
+                    // 息屏：这里挂起，期间零请求
+                    foregroundFlow.first { it }
+                    // 退避等待；若中途息屏则直接进入下一轮（下一轮会挂起等待亮屏）
+                    val wentBackground = withTimeoutOrNull(backoff) { foregroundFlow.first { !it } }
+                    if (wentBackground != null) continue
+                } else {
+                    delay(backoff)
+                }
 
                 val remote = runCatching { client.getConversation(id) }.getOrNull()
                 if (remote == null) {
-                    backoff = (backoff * 2).coerceAtMost(MAX_POLL_INTERVAL)
+                    backoff = (backoff * 2).coerceAtMost(maxPollInterval())
                     continue
                 }
                 val remoteStatus = remote.status.toTaskStatusOrNull()
@@ -328,7 +338,7 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
                 }
                 val now = _tasks.value.firstOrNull { it.id == id }?.status
                 if (now == null || now.isTerminal()) return@launch
-                backoff = (backoff * 2).coerceAtMost(MAX_POLL_INTERVAL)
+                backoff = (backoff * 2).coerceAtMost(maxPollInterval())
             }
         }
     }
@@ -354,6 +364,20 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
 
     private fun TaskStatus.isTerminal() =
         this == TaskStatus.DONE || this == TaskStatus.FAILED || this == TaskStatus.STOPPED
+
+    /** 省流开关决定退避上限：省流 30s，否则 8s。 */
+    private fun maxPollInterval(): Long =
+        if (settings.extremeSaver) SAVER_MAX_POLL_INTERVAL else MAX_POLL_INTERVAL
+
+    /**
+     * 云端回放偶尔会把同一条消息重复推上来（常见于刚在本地发过的那条）。
+     * 相邻同角色且文本一致的只保留一条，避免对话页出现两遍。
+     */
+    private fun List<ChatMessage>.dedupeMessages(): List<ChatMessage> =
+        filterIndexed { index, msg ->
+            val prev = if (index == 0) null else this[index - 1]
+            prev == null || prev.role != msg.role || prev.text.trim() != msg.text.trim()
+        }
 
     private fun envOf(id: String): ExecEnv =
         _tasks.value.firstOrNull { it.id == id }?.env ?: ExecEnv.CLOUD
@@ -423,7 +447,10 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
     private companion object {
         /** 首次轮询间隔，之后每次翻倍，最长 [MAX_POLL_INTERVAL]。 */
         const val INITIAL_POLL_INTERVAL = 2_000L
-        const val MAX_POLL_INTERVAL = 30_000L
+        const val MAX_POLL_INTERVAL = 8_000L
+
+        /** 极致省流下的退避上限。 */
+        const val SAVER_MAX_POLL_INTERVAL = 30_000L
 
         /** 只在掉线时才探测的间隔。 */
         const val HEALTH_INTERVAL = 60_000L

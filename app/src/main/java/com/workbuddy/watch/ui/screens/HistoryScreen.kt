@@ -70,6 +70,7 @@ fun HistoryDetailScreen(
     busy: Boolean,
     draft: String,
     modelLabel: String,
+    cloudModel: String? = null,
     models: List<RemoteModel>,
     modelsLoading: Boolean,
     modelsError: String?,
@@ -128,16 +129,27 @@ fun HistoryDetailScreen(
                 Spacer(Modifier.width(32.dp))
             }
 
-            // 模型 chip：点击弹出选择
+            // 模型 chip：点击弹出选择；右侧显示云端实际在用的模型，切换是否生效一眼可见
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(bottom = 4.dp),
-                horizontalArrangement = Arrangement.Center
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 ModelChip(modelLabel) {
                     showModels = true
                     if (models.isEmpty() && !modelsLoading) onLoadModels()
+                }
+                if (!cloudModel.isNullOrBlank()) {
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = "云端 " + cloudModel,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
             }
 

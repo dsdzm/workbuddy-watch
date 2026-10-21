@@ -207,6 +207,7 @@ private fun WatchApp(vm: WatchViewModel = viewModel()) {
                     busy = state.historyBusy,
                     draft = state.draft,
                     modelLabel = state.modelLabel,
+                    cloudModel = state.cloudModel,
                     models = state.models,
                     modelsLoading = state.modelsLoading,
                     modelsError = state.modelsError,
@@ -255,6 +256,8 @@ private fun WatchApp(vm: WatchViewModel = viewModel()) {
                     onToggleShape = vm::toggleScreenShape,
                     onModels = { vm.openModels(Screen.SETTINGS) },
                     onCheckEnv = vm::checkEnvironment,
+                    extremeSaver = state.extremeSaver,
+                    onToggleSaver = vm::toggleExtremeSaver,
                     onBack = vm::closeSettings
                 )
 

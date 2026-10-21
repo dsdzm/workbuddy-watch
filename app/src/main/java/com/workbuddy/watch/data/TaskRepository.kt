@@ -50,6 +50,12 @@ interface TaskRepository {
     /** 云端可选模型列表（模型选择设置页用）。 */
     suspend fun listModels(): List<RemoteModel> = emptyList()
 
+    /** 云端会话当前实际使用的模型名；null 表示取不到。 */
+    suspend fun remoteModel(id: String): String? = null
+
+    /** 用户刚切了模型，立刻同步到云端会话（对话页切完就能确认是否生效）。 */
+    fun applyModelNow(id: String) {}
+
     /** 记录某产物已下载到本机的路径，供界面展示「已下载 / 打开」。 */
     fun markDownloaded(taskId: String, uri: String, localPath: String)
 

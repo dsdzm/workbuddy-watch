@@ -49,6 +49,8 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         /** 云上状态原值：RUNNING / COMPLETED / EXPIRED / CANCELLED / WAITING_USER_INPUT */
         val status: String,
         val session: Session? = null,
+        /** 云端会话当前实际使用的模型名，用来确认切换是否真的生效。 */
+        val model: String? = null,
         /** 会话里出现过的产物文件（从返回体里解析 agent://files/… 引用）。 */
         val artifacts: List<Artifact> = emptyList(),
         /** 会话正处于等待用户补充信息时的问题；未能解析到具体问题时为通用提问。 */
@@ -774,6 +776,11 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             title = o.optString("name").takeIf { it.isNotBlank() }
                 ?: o.optString("title").takeIf { it.isNotBlank() },
             status = status,
+            model = sequenceOf(
+                o.optString("model"),
+                o.optJSONObject("status")?.optString("model").orEmpty(),
+                session?.optString("model").orEmpty()
+            ).firstOrNull { it.isNotBlank() },
             session = parseSession(id, session),
             artifacts = artifactsOf(raw),
             ask = askOf(o, status)

@@ -391,6 +391,8 @@ fun SettingsScreen(
     onToggleShape: () -> Unit,
     onModels: () -> Unit,
     onCheckEnv: () -> Unit,
+    extremeSaver: Boolean = false,
+    onToggleSaver: () -> Unit = {},
     onBack: () -> Unit,
     version: String = BuildConfig.VERSION_NAME
 ) {
@@ -441,6 +443,21 @@ fun SettingsScreen(
                 leadingIcon = Icons.Filled.Star,
                 trailing = "更改",
                 onClick = onModels
+            )
+        }
+
+        item { SectionLabel("同步") }
+        item {
+            PillRow(
+                title = "极致省流",
+                subtitle = if (extremeSaver) {
+                    "已开启：息屏不同步、拉取间隔更长，最省流量"
+                } else {
+                    "已关闭：息屏也继续同步，消息到得更快"
+                },
+                leadingIcon = Icons.Filled.Refresh,
+                trailing = if (extremeSaver) "开" else "关",
+                onClick = onToggleSaver
             )
         }
 

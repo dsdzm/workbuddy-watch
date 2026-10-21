@@ -105,7 +105,16 @@ data class WatchUiState(
     /** 积分用量：登录后从 `/billing/meter` 接口拉取。 */
     val usage: UsageSnapshot? = null,
     val usageLoading: Boolean = false,
-    val usageError: String? = null
+    val usageError: String? = null,
+    /**
+     * 云端会话**实际**使用的模型名。
+     *
+     * 模型的自述不可信（它自己也读不到底层），要以云端会话返回的 model 字段为准，
+     * 所以对话页会把这一项直接显示出来，切换是否生效一眼可见。
+     */
+    val cloudModel: String? = null,
+    /** 极致省流开关状态（默认关闭，优先同步速度）。 */
+    val extremeSaver: Boolean = false
 ) {
     val activeTask: Task? get() = tasks.firstOrNull { it.id == activeTaskId }
     val workingTask: Task? get() = tasks.firstOrNull { it.status == TaskStatus.WORKING || it.status == TaskStatus.BLOCKED }
@@ -126,7 +135,8 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
         WatchUiState(
             roundScreen = settings.roundScreen,
             shapeChosen = settings.shapeChosen,
-            selectedModel = settings.selectedModel
+            selectedModel = settings.selectedModel,
+            extremeSaver = settings.extremeSaver
         )
     )
     val ui: StateFlow<WatchUiState> = _ui.asStateFlow()
@@ -522,9 +532,11 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
                 historyTitle = title,
                 history = emptyList(),
                 historyLoading = true,
-                historyError = null
+                historyError = null,
+                cloudModel = null
             )
         }
+        refreshCloudModel(id)
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) { runCatching { repo.loadHistory(id) } }
             result
@@ -544,7 +556,9 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun closeHistory() =
-        _ui.update { it.copy(screen = Screen.LIST, history = emptyList(), historyError = null) }
+        _ui.update {
+            it.copy(screen = Screen.LIST, history = emptyList(), historyError = null, cloudModel = null)
+        }
 
     /**
      * 在历史对话页里继续追问。
@@ -568,17 +582,28 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
         }
         viewModelScope.launch {
             withContext(Dispatchers.IO) { runCatching { repo.reply(id, text) } }
-            repeat(HISTORY_POLL_TIMES) {
-                delay(HISTORY_POLL_INTERVAL)
+            // 省流模式等得久、次数少；普通模式 1.2s 一拉，追问结果到得更快
+            val interval = if (settings.extremeSaver) HISTORY_POLL_INTERVAL else FAST_HISTORY_POLL_INTERVAL
+            val times = if (settings.extremeSaver) HISTORY_POLL_TIMES else HISTORY_POLL_TIMES * 3
+            repeat(times) {
+                delay(interval)
                 val messages = withContext(Dispatchers.IO) {
                     runCatching { repo.loadHistory(id) }.getOrNull()
                 }
-                if (messages != null && messages.size > baseline) {
-                    _ui.update { it.copy(history = messages, historyBusy = false) }
-                    return@launch
+                if (messages != null) {
+                    // 云端是否已经把这句收进历史
+                    val sent = messages.any { it.role == ChatRole.USER && it.text.trim() == text.trim() }
+                    if (sent || messages.size > baseline) {
+                        // 已收录就整段替换；没收录则保留本地这条，避免它先消失再冒出来
+                        val shown = if (sent) messages else messages + ChatMessage(ChatRole.USER, text)
+                        _ui.update { it.copy(history = shown, historyBusy = false) }
+                        refreshCloudModel(id)
+                        return@launch
+                    }
                 }
             }
             _ui.update { it.copy(historyBusy = false) }
+            refreshCloudModel(id)
         }
     }
 
@@ -639,10 +664,37 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
         if (id.isBlank()) "已使用云端默认模型"
         else "已切换到 " + (_ui.value.models.firstOrNull { it.id == id }?.name ?: id)
 
-    /** 对话页内切换模型：只持久化，不改变当前页面。 */
+    /** 对话页内切换模型：持久化并立刻同步到当前会话。 */
     fun chooseModelInline(id: String) {
         settings.selectedModel = id
         _ui.update { it.copy(selectedModel = id, toast = modelToast(id)) }
+        clearToastLater()
+        _ui.value.activeTaskId?.let { activeId ->
+            repo.applyModelNow(activeId)
+            refreshCloudModel(activeId)
+        }
+    }
+
+    /** 查一次云端会话真正在用的模型，用于确认切换是否生效。 */
+    private fun refreshCloudModel(id: String) {
+        viewModelScope.launch {
+            val model = withContext(Dispatchers.IO) {
+                runCatching { repo.remoteModel(id) }.getOrNull()
+            }
+            _ui.update { it.copy(cloudModel = model) }
+        }
+    }
+
+    /** 切换极致省流：关闭时息屏也继续同步，打开后息屏零请求、退避拉长。 */
+    fun toggleExtremeSaver() {
+        val next = !settings.extremeSaver
+        settings.extremeSaver = next
+        _ui.update {
+            it.copy(
+                extremeSaver = next,
+                toast = if (next) "已开启极致省流，息屏不再同步" else "已关闭极致省流，同步更及时"
+            )
+        }
         clearToastLater()
     }
 
@@ -907,5 +959,8 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
         /** 追问后回拉历史的最大次数与间隔：3 秒一次，约两分钟。 */
         const val HISTORY_POLL_TIMES = 40
         const val HISTORY_POLL_INTERVAL = 3_000L
+
+        /** 关闭极致省流时的追问轮询间隔。 */
+        const val FAST_HISTORY_POLL_INTERVAL = 1_200L
     }
 }
