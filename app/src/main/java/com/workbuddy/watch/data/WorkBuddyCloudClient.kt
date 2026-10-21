@@ -51,7 +51,9 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         val conversationId: String,
         val link: String,
         val token: String,
-        val cwd: String?
+        val cwd: String?,
+        /** 沙箱数据网关（`49983-<id>.…`），附件要 POST 到这里的 `/files` 才能被 agent 读到。 */
+        val dataEndpoint: String? = null
     )
 
     data class RemoteConversation(
@@ -136,13 +138,16 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         val ent = enterpriseId?.trim()?.takeIf { it.isNotBlank() } ?: CloudSettings.ENTERPRISE_PERSONAL
         val data = callEnvelope("GET", "/console/enterprises/${enc(ent)}/models", null) ?: return emptyList()
         val array = data.optJSONArray("models") ?: return emptyList()
+        // `models` 只是模型目录，里面混着账号没开通的项（如 hunyuan-2.0-thinking），
+        // 真正能用于会话的是 `agents[name=cli].models` 这一组，网页端也只渲染这组。
+        val enabled = cliModelIds(data)
         return (0 until array.length()).mapNotNull { i ->
             val o = array.optJSONObject(i) ?: return@mapNotNull null
             if (o.optBoolean("disabled")) return@mapNotNull null
-            // 云端要的是 `model`（真正的模型标识，如 deepseek-v4.1-flash / hy4-preview）；
-            // `id` 只是目录项 ID，直接当模型发会 400 `service info not found`
-            val modelId = o.optString("model").ifBlank { o.optString("id") }
+            // 会话里传的模型标识就是目录项的 `id`（deepseek-v4.1-flash / hy4-preview）
+            val modelId = o.optString("id").ifBlank { o.optString("model") }
             if (modelId.isBlank()) return@mapNotNull null
+            if (enabled.isNotEmpty() && modelId !in enabled) return@mapNotNull null
             RemoteModel(
                 id = modelId,
                 name = o.optString("name").ifBlank { o.optString("displayName") }
@@ -152,6 +157,20 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
                     .takeIf { it.isNotBlank() } ?: o.optString("description").takeIf { it.isNotBlank() }
             )
         }
+    }
+
+    /** `agents[]` 中 `cli`（tags 含 `default`）那组 `models` 才是账号已开通的模型清单。 */
+    private fun cliModelIds(data: JSONObject): Set<String> {
+        val agents = data.optJSONArray("agents") ?: return emptySet()
+        val agent = (0 until agents.length())
+            .mapNotNull { agents.optJSONObject(it) }
+            .firstOrNull { it.optString("name") == "cli" }
+            ?: return emptySet()
+        val models = agent.optJSONArray("models") ?: return emptySet()
+        return (0 until models.length())
+            .map { models.optString(it) }
+            .filter { it.isNotBlank() }
+            .toSet()
     }
 
     /**
@@ -239,111 +258,122 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
     }
 
     /**
-     * 取某个会话**真正可用**的模型清单（ACP 侧返回的 `availableModels`）。
-     *
-     * console 的 `/models` 是模型目录，会把账号没有开通的模型也列出来（例如
-     * `hunyuan-2.0-thinking`），拿它去 `session/set_model` 会被云端回
-     * `400 model [...] service info not found`。网页端的做法是取这两者的交集：
-     * `models.filter(m => availableModels.includes(m.id))`，这里照做。
-     *
-     * 数据来源是 `session/load` 的 JSON-RPC 响应：
-     * `result.models._meta["codebuddy.ai"].availableModels`（也兼容 `result.models.availableModels`）。
-     */
-    fun fetchAvailableModels(session: Session, timeoutMs: Long = MODELS_TIMEOUT): Set<String> {
-        val url = normalizeLink(session.link)
-        val stream = (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = CONNECT_TIMEOUT
-            readTimeout = (timeoutMs + 2000L).toInt()
-            setRequestProperty("Authorization", "Bearer ${session.token}")
-            setRequestProperty("User-Agent", settings.userAgent)
-            setRequestProperty("Accept", "text/event-stream")
-        }
-        return try {
-            stream.responseCode
-            val connectionId = stream.getHeaderField(ACP_CONNECTION_HEADER) ?: return emptySet()
-            val acpSessionToken = stream.getHeaderField(ACP_SESSION_TOKEN_HEADER)?.trim().orEmpty()
-            val params = JSONObject()
-                .put("sessionId", session.conversationId)
-                .put("cwd", session.cwd.orEmpty())
-                .put("mcpServers", JSONArray())
-            Thread {
-                runCatching {
-                    postRpc(
-                        url = url,
-                        token = session.token,
-                        connectionId = connectionId,
-                        acpSessionToken = acpSessionToken,
-                        method = ACP_LOAD,
-                        params = params,
-                        readTimeout = timeoutMs.toInt()
-                    )
-                }
-            }.apply { isDaemon = true; start() }
-
-            val deadline = System.currentTimeMillis() + timeoutMs
-            val reader = BufferedReader(InputStreamReader(stream.inputStream, Charsets.UTF_8))
-            while (System.currentTimeMillis() < deadline) {
-                val line = runCatching { reader.readLine() }.getOrNull() ?: break
-                if (!line.startsWith("data:")) continue
-                val payload = runCatching { JSONObject(line.removePrefix("data:").trim()) }.getOrNull()
-                    ?: continue
-                val ids = availableModelIds(payload.optJSONObject("result"))
-                if (ids.isNotEmpty()) return ids
-            }
-            emptySet()
-        } catch (_: Exception) {
-            emptySet()
-        } finally {
-            runCatching { stream.disconnect() }
-        }
-    }
-
-    /** 从 `session/load` 的 result 里拆出可用模型 ID 集合。 */
-    private fun availableModelIds(result: JSONObject?): Set<String> {
-        val models = result?.optJSONObject("models") ?: return emptySet()
-        val meta = models.optJSONObject("_meta")?.optJSONObject("codebuddy.ai")
-        val array = meta?.optJSONArray("availableModels")
-            ?: models.optJSONArray("availableModels")
-            ?: return emptySet()
-        return (0 until array.length()).mapNotNull { i ->
-            when (val item = array.opt(i)) {
-                is JSONObject -> item.optString("id").ifBlank { item.optString("model") }
-                else -> item?.toString().orEmpty()
-            }.takeIf { it.isNotBlank() }
-        }.toSet()
-    }
-
-    /**
      * 下发或追问。
      *
-     * 图片必须以 ACP `image` 内容块（内联 base64）发送：只给 `resource_link` 的话，
-     * agent 拿到的只是 URI 文本，沙箱里没有图本体，它会回「你发给我的是一段 JSON」。
-     * 其它文件继续用 `resource_link`，由沙箱按 URI 读取。
+     * 附件按网页端的方式走：先把字节 POST 到沙箱 `{e2bDataEndpoint}/files`，
+     * 再以 `resource_link` 下发，`_meta.codebuddy.ai.sandboxPath` 指向沙箱本地路径，
+     * 并追加一段隐藏的 `<attachment_sandbox_paths>` 告诉 agent 直接读该路径。
+     * 这样官方客户端能点开（COS 预签名地址），agent 也能读到内容（沙箱路径）。
      *
      * prompt 的响应要等云端整个回合结束，用短超时把调用方尽快放回；
      * 指令已经随请求体送达，断开后云端仍会继续执行。
      */
     fun sendPrompt(session: Session, text: String, attachments: List<Artifact> = emptyList()) {
+        // 网页端会把当前模型同时写进内容块与请求的 `_meta`；只发 `session/set_model`
+        // 时官方客户端仍可能按账号默认模型展示（选了 DeepSeek 却显示混元）。
+        val model = settings.selectedModel.ifBlank { DEFAULT_MODEL }
         val blocks = JSONArray()
-        if (text.isNotBlank()) blocks.put(JSONObject().put("type", "text").put("text", text))
-        attachments.forEach { a -> blocks.put(contentBlock(a)) }
+        val sourceBlocks = JSONArray()
+        val sandboxPaths = mutableListOf<Pair<String, String>>()
+
+        attachments.forEach { a ->
+            val bytes = inlineBytes(a)
+            val sandboxPath = bytes?.let {
+                runCatching { uploadToSandbox(session, a.name, it) }.getOrNull()
+            }
+            val block = if (sandboxPath != null && bytes != null) {
+                sandboxPaths += a.name to sandboxPath
+                resourceLinkBlock(a, bytes.size, sandboxPath, model)
+            } else {
+                legacyContentBlock(a)
+            }
+            blocks.put(block)
+            sourceBlocks.put(block)
+        }
+
+        if (text.isNotBlank()) {
+            blocks.put(textBlock(text, model))
+            sourceBlocks.put(JSONObject().put("type", "text").put("text", text))
+        }
+        if (sandboxPaths.isNotEmpty()) {
+            blocks.put(sandboxPathBlock(sandboxPaths, model))
+        }
+
+        val meta = JSONObject()
+            .put("conversationId", session.conversationId)
+            .put("model", model)
+            .put("extra", JSONObject().put("sourceContentBlocks", sourceBlocks))
         val params = JSONObject()
             .put("sessionId", session.conversationId)
             .put("cwd", session.cwd.orEmpty())
             .put("mcpServers", JSONArray())
             .put("prompt", blocks)
+            .put("_meta", JSONObject().put("codebuddy.ai", meta))
         linkOf(session).rpc(ACP_PROMPT, params, PROMPT_READ_TIMEOUT)
     }
 
+    private fun textBlock(text: String, model: String): JSONObject = JSONObject()
+        .put("type", "text")
+        .put("text", text)
+        .put("_meta", JSONObject().put("codebuddy.ai", JSONObject().put("model", model)))
+
+    /** 网页端同款 `resource_link`：COS 地址给官方端展示，`sandboxPath` 给 agent 读。 */
+    private fun resourceLinkBlock(
+        a: Artifact,
+        size: Int,
+        sandboxPath: String,
+        model: String
+    ): JSONObject {
+        val meta = JSONObject()
+            .put("displayAsContext", false)
+            .put("displayAsPhrase", true)
+            .put("icon", "file")
+            .put("blockStatus", "completed")
+            .put("timestamp", System.currentTimeMillis())
+            .put("filename", a.name)
+            .put("fileName", a.name)
+            .put("originalFilename", a.name)
+            .put("size", size)
+            .put("displayText", a.name)
+            .put("title", a.name)
+            .put("attachmentTransport", "cloud")
+            .put(
+                "codebuddy.ai",
+                JSONObject().put("sandboxPath", sandboxPath).put("model", model)
+            )
+        return JSONObject()
+            .put("type", "resource_link")
+            .put("name", a.name)
+            .put("title", a.name)
+            .put("uri", presignedDownloadUrl(a) ?: a.uri)
+            .put("mimeType", a.mimeType ?: "application/octet-stream")
+            .put("_meta", meta)
+    }
+
+    /** 隐藏提示：明确告诉 agent 附件已经在沙箱里，不要再下载副本。 */
+    private fun sandboxPathBlock(paths: List<Pair<String, String>>, model: String): JSONObject {
+        val lines = paths.joinToString("\n") { (name, path) -> "- $name: $path" }
+        val text = "<attachment_sandbox_paths>\n" +
+            "以下附件已存放在沙箱本地路径，请直接读写这些路径（不要另行下载到其他位置）。\n" +
+            "用户正在同一路径上编辑同一份文件，另存副本会导致双方改动互相丢失。\n" +
+            "$lines\n" +
+            "</attachment_sandbox_paths>"
+        return JSONObject()
+            .put("type", "text")
+            .put("text", text)
+            .put(
+                "_meta",
+                JSONObject()
+                    .put("codebuddy.ai/hiddenPromptContext", "attachment-sandbox-paths")
+                    .put("codebuddy.ai", JSONObject().put("model", model))
+            )
+    }
+
     /**
-     * 附件 → ACP 内容块。
-     *
-     * 只发 `resource_link` 的话，agent 沙箱读不到任何内容（它只看到一串 URI），
-     * 所以内容必须内联：图片走 `image`，文本走 `resource.text`，其它二进制走 `resource.blob`。
-     * 取不到字节或体积超限才退回链接，并尽量换成预签名下载地址，官方客户端才能点开。
+     * 旧版内联回退：沙箱 `/files` 上传失败时仍让 agent 能读到内容。
+     * 图片走 `image`，文本走 `resource.text`，其它二进制走 `resource.blob`。
      */
-    private fun contentBlock(a: Artifact): JSONObject {
+    private fun legacyContentBlock(a: Artifact): JSONObject {
         val mime = a.mimeType.orEmpty()
         val bytes = inlineBytes(a)
         if (bytes != null && bytes.isNotEmpty()) {
@@ -573,7 +603,9 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
      * 返回可直接在 prompt 里引用的 [Artifact]。
      */
     fun uploadFile(name: String, mimeType: String, bytes: ByteArray): Artifact {
-        val item = presign(listOf(name)).firstOrNull()
+        // 与网页端一致：对象 key 放在 `uploads/` 下，带时间戳和随机串避免重名
+        val objectKey = "uploads/${System.currentTimeMillis()}-${randomTag()}-${safeFileName(name)}"
+        val item = presign(listOf(objectKey)).firstOrNull()
             ?: throw IllegalStateException("上传失败：未取得预签名地址")
         val uploadUrl = item.optString("upload_url").ifBlank { item.optString("url") }
         if (uploadUrl.isBlank()) throw IllegalStateException("上传失败：响应缺少 upload_url")
@@ -582,7 +614,8 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             connectTimeout = CONNECT_TIMEOUT
             readTimeout = TRANSFER_TIMEOUT
             doOutput = true
-            setRequestProperty("Content-Type", mimeType)
+            // 网页端固定用 octet-stream，预签名只签了 host，不影响的
+            setRequestProperty("Content-Type", "application/octet-stream")
         }
         try {
             conn.outputStream.use { it.write(bytes) }
@@ -591,10 +624,62 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         } finally {
             conn.disconnect()
         }
-        val artifact = Artifact(name = name, uri = "agent://files/${objectKeyOf(name)}", mimeType = mimeType)
+        val artifact = Artifact(name = name, uri = "agent://files/$objectKey", mimeType = mimeType)
         if (bytes.size <= MAX_INLINE_IMAGE) uploadCache[artifact.uri] = bytes
         return artifact
     }
+
+    /**
+     * 把附件字节写进沙箱：`POST {e2bDataEndpoint}/files?path=…&username=root`（multipart）。
+     * 返回沙箱里的绝对路径，agent 直接读写这个路径；失败返回 null，调用方退回内联。
+     */
+    private fun uploadToSandbox(session: Session, name: String, bytes: ByteArray): String? {
+        val endpoint = session.dataEndpoint?.trimEnd('/')?.takeIf { it.isNotBlank() } ?: return null
+        val safe = safeFileName(name)
+        if (safe.isBlank()) return null
+        val path = "/root/uploads/wb-watch-${System.currentTimeMillis()}/$safe"
+        val boundary = "----WbWatchBoundary${System.nanoTime()}"
+        val head = (
+            "--$boundary\r\n" +
+                "Content-Disposition: form-data; name=\"file\"; filename=\"$safe\"\r\n" +
+                "Content-Type: application/octet-stream\r\n\r\n"
+            ).toByteArray(Charsets.UTF_8)
+        val tail = "\r\n--$boundary--\r\n".toByteArray(Charsets.UTF_8)
+        val conn = (URL("$endpoint/files?path=${enc(path)}&username=root").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = CONNECT_TIMEOUT
+            readTimeout = TRANSFER_TIMEOUT
+            doOutput = true
+            setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+            setRequestProperty("x-access-token", session.token)
+            setRequestProperty("Origin", base())
+            setRequestProperty("Accept", "*/*")
+        }
+        return try {
+            conn.outputStream.use { out ->
+                out.write(head)
+                out.write(bytes)
+                out.write(tail)
+            }
+            if (conn.responseCode !in 200..299) return null
+            val text = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            JSONArray(text).optJSONObject(0)?.optString("path")?.takeIf { it.isNotBlank() }
+        } catch (_: Exception) {
+            null
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    /** 文件名只保留安全字符，避免 multipart / 沙箱路径被引号或换行截断。 */
+    private fun safeFileName(name: String): String =
+        name.substringAfterLast('/').substringAfterLast('\\')
+            .replace(Regex("[\\r\\n\"]"), "_")
+            .ifBlank { "attachment" }
+
+    /** 对象 key 里的随机段，网页端是 7 位小写字母数字。 */
+    private fun randomTag(): String =
+        java.util.UUID.randomUUID().toString().replace("-", "").take(7)
 
     /** 下载产物文件字节（换取预签名下载地址后 GET）。 */
     fun downloadArtifact(artifact: Artifact): ByteArray {
@@ -887,7 +972,9 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             conversationId = id,
             link = link,
             token = token,
-            cwd = o.optString("cwd").takeIf { it.isNotBlank() }
+            cwd = o.optString("cwd").takeIf { it.isNotBlank() },
+            dataEndpoint = o.optString("e2bDataEndpoint").takeIf { it.isNotBlank() }
+                ?: o.optString("dataEndpoint").takeIf { it.isNotBlank() }
         )
     }
 
@@ -1062,8 +1149,6 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         private const val MAX_INLINE_IMAGE = 8 * 1024 * 1024
         /** 上传缓存保留的份数。 */
         private const val MAX_CACHED_UPLOADS = 4
-        /** 拉取会话可用模型清单（session/load 响应）的最长等待。 */
-        private const val MODELS_TIMEOUT = 8_000L
 
         /** 网关判定未登录；此时尝试用 Keycloak SSO cookie 静默续期。 */
         private const val HTTP_UNAUTHORIZED = 401

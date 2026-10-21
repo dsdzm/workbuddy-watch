@@ -62,9 +62,6 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
         _modelError.value = null
     }
 
-    /** 会话可用模型缓存：取一次要走 `session/load` 回放，缓存几分钟免得反复拉。 */
-    private var modelsCache: Pair<Long, Set<String>>? = null
-
     init {
         scope.launch { refreshList() }
         scope.launch { healthLoop() }
@@ -148,26 +145,7 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
         withContext(Dispatchers.IO) { client.loadHistory(sessionOf(id)) }.dedupeMessages()
 
     override suspend fun listModels(): List<RemoteModel> =
-        withContext(Dispatchers.IO) {
-            val catalog = client.listModels(settings.enterpriseId)
-            // console 目录里混着账号没开通的模型（如 hunyuan-2.0-thinking），
-            // 必须与 ACP 的 availableModels 取交集，否则选到就会 400
-            val available = availableModels()
-            if (available.isEmpty()) catalog
-            else catalog.filter { it.id in available }.ifEmpty { catalog }
-        }
-
-    /** 会话级可用模型（带 5 分钟缓存：取一次要走 session/load 回放）。 */
-    private fun availableModels(): Set<String> {
-        val now = System.currentTimeMillis()
-        modelsCache?.let { (at, ids) ->
-            if (ids.isNotEmpty() && now - at < MODELS_CACHE_TTL) return ids
-        }
-        val id = _tasks.value.firstOrNull()?.id ?: return emptySet()
-        val ids = runCatching { client.fetchAvailableModels(sessionOf(id)) }.getOrDefault(emptySet())
-        if (ids.isNotEmpty()) modelsCache = now to ids
-        return ids
-    }
+        withContext(Dispatchers.IO) { client.listModels(settings.enterpriseId) }
 
     override suspend fun remoteModel(id: String): String? =
         withContext(Dispatchers.IO) { runCatching { client.getConversation(id)?.model }.getOrNull() }
@@ -504,7 +482,5 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
         /** 常驻 ACP 连接的空闲回收时间（超过即释放，重连时模型会重设）。 */
         const val LINK_IDLE_TTL = 15 * 60_000L
 
-        /** 会话可用模型缓存时长。 */
-        const val MODELS_CACHE_TTL = 5 * 60_000L
     }
 }
