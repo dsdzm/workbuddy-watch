@@ -22,6 +22,7 @@ import androidx.wear.compose.material3.Text
 import com.workbuddy.watch.data.ChatMessage
 import com.workbuddy.watch.data.ChatRole
 import com.workbuddy.watch.ui.components.InfoPill
+import com.workbuddy.watch.ui.components.MarkdownText
 import com.workbuddy.watch.ui.components.MutedPillButton
 import com.workbuddy.watch.ui.components.PageHeader
 import com.workbuddy.watch.ui.components.WatchPage
@@ -45,18 +46,9 @@ fun HistoryDetailScreen(
     onBack: () -> Unit
 ) {
     WatchPage(roundScreen) {
-        item { PageHeader("历史对话", onBack) }
-        if (title.isNotBlank()) {
-            item {
-                InfoPill {
-                    Text(
-                        title,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = WatchPalette.OnPillVariant
-                    )
-                }
-            }
-        }
+        item { PageHeader(title = title.ifBlank { "历史对话" }, onBack = onBack) }
+        // 圆屏顶部是弧形，先空出一段，避免第一条消息贴着表盘边缘被裁掉
+        item { Spacer(Modifier.height(if (roundScreen) 26.dp else 10.dp)) }
         if (loading) {
             item {
                 InfoPill {
@@ -83,34 +75,52 @@ fun HistoryDetailScreen(
             }
             item { MutedPillButton(text = "重新加载", onClick = onReload) }
         }
-        items(messages) { msg -> MessageBubble(msg) }
+        if (!loading && error == null && messages.isEmpty()) {
+            item { InfoPill { Text("未读取到该会话的消息", style = MaterialTheme.typography.labelSmall) } }
+        }
+        items(messages) { msg -> MessageBubble(msg, roundScreen) }
+        item { Spacer(Modifier.height(if (roundScreen) 44.dp else 16.dp)) }
     }
 }
 
-/** 单条消息气泡：用户用强调容器、助手用中性药丸，腕上仍保持整行宽度以保证可读性。 */
+/** 单条消息气泡：角色标签在上、容器在下，与参考对话页一致。 */
 @Composable
-private fun MessageBubble(msg: ChatMessage) {
+private fun MessageBubble(msg: ChatMessage, roundScreen: Boolean) {
     val isUser = msg.role == ChatRole.USER
-    Column(Modifier.fillMaxWidth()) {
+    // 圆屏两侧是弧线，气泡略收窄，长文本才不会被表盘边缘切掉
+    val widthFactor = when {
+        !roundScreen -> 1f
+        isUser -> 0.90f
+        else -> 0.96f
+    }
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = if (roundScreen) 2.dp else 0.dp)
+    ) {
         Text(
             if (isUser) "我" else "WorkBuddy",
             style = MaterialTheme.typography.labelSmall,
             color = WatchPalette.OnPillVariant,
-            modifier = Modifier.padding(start = 10.dp)
+            modifier = Modifier.padding(start = 10.dp, bottom = 4.dp)
         )
-        Spacer(Modifier.height(4.dp))
         Box(
             Modifier
-                .fillMaxWidth()
+                .fillMaxWidth(widthFactor)
                 .clip(PillShape)
                 .background(if (isUser) WatchPalette.PillHigh else WatchPalette.Pill)
-                .padding(horizontal = 16.dp, vertical = 12.dp)
+                .padding(horizontal = 14.dp, vertical = 12.dp)
         ) {
-            Text(
-                msg.text,
-                style = MaterialTheme.typography.bodyMedium,
-                color = WatchPalette.OnPill
-            )
+            if (isUser) {
+                Text(
+                    msg.text,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = WatchPalette.OnPill
+                )
+            } else {
+                // 助手回复是 Markdown，原样铺开会满屏 `**` 和表格竖线
+                MarkdownText(msg.text)
+            }
         }
     }
 }

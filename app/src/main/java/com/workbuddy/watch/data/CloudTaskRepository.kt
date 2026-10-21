@@ -53,8 +53,9 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
             val conversation = client.createConversation(prompt, model)
             val session = conversation.session ?: client.fetchSession(conversation.id)
             sessions[conversation.id] = session
-            // 附件以 resource_link 内容块单独下发（首轮指令已随创建会话的请求发出，不重复文本）
-            if (attachments.isNotEmpty()) client.sendPrompt(session, "", attachments)
+            // 关键：create 里的 prompt 只截前 100 字用来生成会话标题，不会真正执行。
+            // 首轮指令必须通过 ACP session/prompt 下发，否则只会留下一个空会话。
+            client.sendPrompt(session, prompt, attachments)
             val task = Task(
                 id = conversation.id,
                 title = conversation.title ?: prompt,

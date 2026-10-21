@@ -243,6 +243,8 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         }
         val params = JSONObject()
             .put("sessionId", session.conversationId)
+            .put("cwd", session.cwd.orEmpty())
+            .put("mcpServers", JSONArray())
             .put("prompt", blocks)
         acpCall(session, ACP_PROMPT, params)
     }
