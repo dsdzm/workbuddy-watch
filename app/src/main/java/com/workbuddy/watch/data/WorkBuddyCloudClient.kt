@@ -8,6 +8,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
+import java.util.Base64
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
@@ -35,6 +36,16 @@ import java.util.concurrent.atomic.AtomicInteger
  *                再 POST JSON-RPC 2.0 `session/prompt`；中断用 `session/cancel`（用 session.token 鉴权）。
  */
 class WorkBuddyCloudClient(private val settings: CloudSettings) {
+
+    /**
+     * 刚上传文件的原始字节，供随后的 prompt 内联图片用。
+     *
+     * 只留最近 [MAX_CACHED_UPLOADS] 个：手表内存有限，且内联只发生在「选完文件马上发送」这一回合。
+     */
+    private val uploadCache = object : LinkedHashMap<String, ByteArray>(4, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>?): Boolean =
+            size > MAX_CACHED_UPLOADS
+    }
 
     data class Session(
         val conversationId: String,
@@ -227,8 +238,11 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
     // ---------- ACP：下发 / 追问 / 中断 ----------
 
     /**
-     * 下发或追问。[attachments] 会作为 ACP `resource_link` 内容块一并发送，
-     * 让云端沙箱能直接读取这些已上传的文件。
+     * 下发或追问。
+     *
+     * 图片必须以 ACP `image` 内容块（内联 base64）发送：只给 `resource_link` 的话，
+     * agent 拿到的只是 URI 文本，沙箱里没有图本体，它会回「你发给我的是一段 JSON」。
+     * 其它文件继续用 `resource_link`，由沙箱按 URI 读取。
      *
      * prompt 的响应要等云端整个回合结束，用短超时把调用方尽快放回；
      * 指令已经随请求体送达，断开后云端仍会继续执行。
@@ -237,6 +251,19 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         val blocks = JSONArray()
         if (text.isNotBlank()) blocks.put(JSONObject().put("type", "text").put("text", text))
         attachments.forEach { a ->
+            val mime = a.mimeType.orEmpty()
+            if (mime.startsWith("image/")) {
+                val bytes = inlineBytes(a)
+                if (bytes != null && bytes.isNotEmpty() && bytes.size <= MAX_INLINE_IMAGE) {
+                    blocks.put(
+                        JSONObject()
+                            .put("type", "image")
+                            .put("mimeType", mime)
+                            .put("data", Base64.getEncoder().encodeToString(bytes))
+                    )
+                    return@forEach
+                }
+            }
             blocks.put(
                 JSONObject()
                     .put("type", "resource_link")
@@ -253,6 +280,10 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             .put("prompt", blocks)
         linkOf(session).rpc(ACP_PROMPT, params, PROMPT_READ_TIMEOUT)
     }
+
+    /** 内联图片用的原始字节：优先取上传时缓存的那份，没有再按预签名地址下载。 */
+    private fun inlineBytes(artifact: Artifact): ByteArray? =
+        uploadCache[artifact.uri] ?: runCatching { downloadArtifact(artifact) }.getOrNull()
 
     /**
      * 设定本会话实际使用的大模型。
@@ -460,7 +491,9 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         } finally {
             conn.disconnect()
         }
-        return Artifact(name = name, uri = "agent://files/${objectKeyOf(name)}", mimeType = mimeType)
+        val artifact = Artifact(name = name, uri = "agent://files/${objectKeyOf(name)}", mimeType = mimeType)
+        if (bytes.size <= MAX_INLINE_IMAGE) uploadCache[artifact.uri] = bytes
+        return artifact
     }
 
     /** 下载产物文件字节（换取预签名下载地址后 GET）。 */
@@ -915,6 +948,11 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         private const val LINK_READ_TIMEOUT = 10 * 60_000
         /** 中断请求要快速返回，避免界面卡在「正在中断」。 */
         private const val CANCEL_TIMEOUT = 8_000
+
+        /** 内联图片上限：再大就退回 `resource_link`，避免单条 prompt 被网关拒收。 */
+        private const val MAX_INLINE_IMAGE = 8 * 1024 * 1024
+        /** 上传缓存保留的份数。 */
+        private const val MAX_CACHED_UPLOADS = 4
 
         /** 网关判定未登录；此时尝试用 Keycloak SSO cookie 静默续期。 */
         private const val HTTP_UNAUTHORIZED = 401
