@@ -175,8 +175,9 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
         }
     }
 
-    /** 切换配置时释放旧的轮询协程。 */
+    /** 切换配置时释放旧的轮询协程与常驻连接。 */
     fun close() {
+        client.closeAllLinks()
         scope.cancel()
     }
 
@@ -200,6 +201,8 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
      * 设置失败也要继续下发，否则用户会卡在「点了没反应」。
      */
     private fun applyModel(id: String, session: WorkBuddyCloudClient.Session) {
+        // 连接被回收/重建后，服务端那边的模型设置跟着失效，必须重发
+        if (!client.hasLink(id)) serverModels.remove(id)
         val model = currentModel()
         if (serverModels[id] == model) return
         runCatching { client.setModel(session, model) }.onSuccess { serverModels[id] = model }
@@ -254,6 +257,8 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
                     .onFailure { markUnhealthy(it) }
             }
             delay(HEALTH_INTERVAL)
+            // 顺手回收长时间没动过的常驻连接，别让息屏后还挂着一条事件流
+            client.trimLinks(LINK_IDLE_TTL)
         }
     }
 
@@ -422,5 +427,8 @@ class CloudTaskRepository(private val settings: CloudSettings) : TaskRepository 
 
         /** 只在掉线时才探测的间隔。 */
         const val HEALTH_INTERVAL = 60_000L
+
+        /** 常驻 ACP 连接的空闲回收时间（超过即释放，重连时模型会重设）。 */
+        const val LINK_IDLE_TTL = 15 * 60_000L
     }
 }

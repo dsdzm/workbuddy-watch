@@ -249,26 +249,29 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             .put("cwd", session.cwd.orEmpty())
             .put("mcpServers", JSONArray())
             .put("prompt", blocks)
-        acpCall(session, ACP_PROMPT, params, timeoutMs = PROMPT_READ_TIMEOUT)
+        linkOf(session).rpc(ACP_PROMPT, params, PROMPT_READ_TIMEOUT)
     }
 
     /**
      * 设定本会话实际使用的大模型。
      *
-     * 建会话接口里的 `model` 只写进会话元信息，真正执行用的模型由 ACP 决定，
-     * 所以追问换模型必须单独走这一步（网页端也是先 `setSessionModel` 再 `prompt`）。
+     * 建会话接口里的 `model` 只写进会话元信息，真正执行用的模型由 ACP 决定；
+     * 且 `session/set_model` 只对**同一条连接**上跑的 agent 生效（网页端也按会话缓存连接）。
      */
     fun setModel(session: Session, modelId: String) {
-        acpCall(
-            session,
+        linkOf(session).rpc(
             ACP_SET_MODEL,
             JSONObject().put("sessionId", session.conversationId).put("modelId", modelId)
         )
     }
 
-    /** 中断当前执行（非退出排队）。 */
+    /** 中断当前执行（非退出排队）。同样必须发在那条常驻连接上。 */
     fun cancelTurn(session: Session) {
-        acpCall(session, ACP_CANCEL, JSONObject().put("sessionId", session.conversationId))
+        linkOf(session).rpc(
+            ACP_CANCEL,
+            JSONObject().put("sessionId", session.conversationId),
+            timeoutMs = CANCEL_TIMEOUT
+        )
     }
 
     /**
@@ -283,7 +286,7 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
             .put("toolCallId", requestId)
             .put("optionId", answer)
             .put("answer", answer)
-        acpCall(session, ACP_RESOLVE_INTERRUPTION, params)
+        linkOf(session).rpc(ACP_RESOLVE_INTERRUPTION, params)
     }
 
     // ---------- 积分用量 ----------
@@ -584,37 +587,108 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
     /** 上次续期失败时间，用于退避（见 [renewSession]）。 */
     private var lastRenewFailedAt = 0L
 
-    // ---------- 内部：ACP ----------
+    // ---------- 内部：常驻 ACP 连接 ----------
 
     /**
-     * ACP 调用。协议要求先建流拿到 `Acp-Connection-Id`（可能还带 `acp-session-token`），
-     * 再用同一 ID 发起 JSON-RPC POST；因此这里保持 GET 连接打开直到 POST 完成。
+     * 一条常驻的 ACP 连接。
+     *
+     * 网页端按会话缓存连接（`connectionCache`），因为 `session/set_model`、
+     * `session/cancel` 这类控制方法只对**同一条连接**上跑的 agent 生效。
+     * 每次新建连接去发，服务端会当成另一个客户端而静默丢弃，
+     * 表现就是「选了模型不生效」「点了中断没反应」，而 prompt 却照常送达。
      */
-    private fun acpCall(
-        session: Session,
-        method: String,
-        params: JSONObject,
-        timeoutMs: Int = READ_TIMEOUT
+    inner class AcpLink internal constructor(
+        val sessionId: String,
+        private val url: String,
+        private val bearer: String,
+        private val connectionId: String,
+        private val sessionToken: String,
+        private val raw: HttpURLConnection
     ) {
+        @Volatile
+        private var closed = false
+        @Volatile
+        var lastUsedAt: Long = System.currentTimeMillis()
+            private set
+
+        val alive: Boolean get() = !closed
+
+        fun rpc(method: String, params: JSONObject, timeoutMs: Int = READ_TIMEOUT) {
+            check(alive) { "ACP 连接已关闭" }
+            postRpc(url, bearer, connectionId, sessionToken, method, params, timeoutMs)
+            lastUsedAt = System.currentTimeMillis()
+        }
+
+        fun close() {
+            closed = true
+            runCatching { raw.disconnect() }
+        }
+    }
+
+    private val links = java.util.concurrent.ConcurrentHashMap<String, AcpLink>()
+
+    private fun linkOf(session: Session): AcpLink {
+        links[session.conversationId]?.takeIf { it.alive }?.let { return it }
+        return openLink(session).also { links[session.conversationId] = it }
+    }
+
+    /** 关闭某会话的常驻连接（换配置 / 手动停止后释放）。 */
+    fun closeLink(id: String) {
+        links.remove(id)?.close()
+    }
+
+    fun closeAllLinks() {
+        links.values.forEach { it.close() }
+        links.clear()
+    }
+
+    /** 回收长时间没动过的连接，避免息屏后还挂着一条流。 */
+    fun trimLinks(maxIdleMs: Long) {
+        val now = System.currentTimeMillis()
+        links.values
+            .filter { !it.alive || now - it.lastUsedAt > maxIdleMs }
+            .forEach { link -> if (links.remove(link.sessionId, link)) link.close() }
+    }
+
+    private fun openLink(session: Session): AcpLink {
         val url = normalizeLink(session.link)
-        val stream = (URL(url).openConnection() as HttpURLConnection).apply {
+        val raw = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = CONNECT_TIMEOUT
-            readTimeout = HANDSHAKE_READ_TIMEOUT
+            readTimeout = LINK_READ_TIMEOUT
             setRequestProperty("Authorization", "Bearer ${session.token}")
             setRequestProperty("User-Agent", settings.userAgent)
             setRequestProperty("Accept", "text/event-stream")
         }
+        val connectionId: String
+        val sessionToken: String
         try {
-            stream.responseCode // 触发请求
-            val connectionId = stream.getHeaderField(ACP_CONNECTION_HEADER)
+            raw.responseCode // 触发握手
+            connectionId = raw.getHeaderField(ACP_CONNECTION_HEADER)
                 ?: throw IllegalStateException("ACP 握手失败：缺少 $ACP_CONNECTION_HEADER")
-            val acpSessionToken = stream.getHeaderField(ACP_SESSION_TOKEN_HEADER)?.trim().orEmpty()
-            postRpc(url, session.token, connectionId, acpSessionToken, method, params, timeoutMs)
-        } finally {
-            runCatching { stream.disconnect() }
+            sessionToken = raw.getHeaderField(ACP_SESSION_TOKEN_HEADER)?.trim().orEmpty()
+        } catch (t: Throwable) {
+            runCatching { raw.disconnect() }
+            throw t
         }
+        val link = AcpLink(session.conversationId, url, session.token, connectionId, sessionToken, raw)
+        // 事件流必须有人读：否则接收缓冲塞满后服务端会主动断连，连接也就不再是「同一条」。
+        // 进度仍由轮询给出，这里只负责把流读掉。
+        Thread({
+            runCatching {
+                raw.inputStream.use { input ->
+                    val buf = ByteArray(8 * 1024)
+                    while (link.alive && input.read(buf) >= 0) {
+                        // 读掉即可
+                    }
+                }
+            }
+        }, "acp-link-${session.conversationId}").apply { isDaemon = true }.start()
+        return link
     }
+
+    /** 这条会话是否还有活着的常驻连接（连接重建后模型设置需要重发）。 */
+    fun hasLink(id: String): Boolean = links[id]?.alive == true
 
     /**
      * 在已建好的 ACP 连接上发一次 JSON-RPC 请求。
@@ -830,6 +904,10 @@ class WorkBuddyCloudClient(private val settings: CloudSettings) {
         /** 上传 / 下载产物文件时允许更长的读写时间。 */
         private const val TRANSFER_TIMEOUT = 60_000
         private const val HANDSHAKE_READ_TIMEOUT = 20_000
+        /** 常驻连接的事件流读超时：要能跨过整个云端回合，断了就重连。 */
+        private const val LINK_READ_TIMEOUT = 10 * 60_000
+        /** 中断请求要快速返回，避免界面卡在「正在中断」。 */
+        private const val CANCEL_TIMEOUT = 8_000
 
         /** 网关判定未登录；此时尝试用 Keycloak SSO cookie 静默续期。 */
         private const val HTTP_UNAUTHORIZED = 401
