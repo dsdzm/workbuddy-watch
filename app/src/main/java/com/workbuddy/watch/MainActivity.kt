@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
@@ -22,6 +23,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.wear.compose.material3.AppScaffold
 import androidx.wear.compose.material3.TimeText
+import com.workbuddy.watch.ui.components.LocalCompactUi
 import com.workbuddy.watch.ui.components.ToastBar
 import com.workbuddy.watch.ui.components.WatchFrame
 import com.workbuddy.watch.ui.components.swipeBack
@@ -52,9 +54,13 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // 320×320 @192dpi 的华为儿童手表 4X：单点触控 + 系统右滑退出，需要整套紧凑布局。
+        val compact = DeviceProfile.isHuaweiWatch4x(this)
         setContent {
             WorkBuddyWatchTheme {
-                WatchApp(vm)
+                CompositionLocalProvider(LocalCompactUi provides compact) {
+                    WatchApp(vm, compact)
+                }
             }
         }
     }
@@ -73,7 +79,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun WatchApp(vm: WatchViewModel = viewModel()) {
+private fun WatchApp(vm: WatchViewModel = viewModel(), compact: Boolean = false) {
     val state by vm.ui.collectAsStateWithLifecycle()
 
     // 附件选择：选到文件后上传到云端，成功后进入待下发列表
@@ -81,8 +87,9 @@ private fun WatchApp(vm: WatchViewModel = viewModel()) {
         uri?.let { vm.uploadPicked(it) }
     }
 
-    // 首次启动：必须先选定表盘形状，之后才进入主界面
-    if (!state.shapeChosen) {
+    // 首次启动：必须先选定表盘形状，之后才进入主界面。
+    // 紧凑屏设备是固定方屏硬件，没有可选形状，直接跳过引导页。
+    if (!compact && !state.shapeChosen) {
         WatchFrame(roundScreen = state.roundScreen) {
             OnboardScreen(
                 roundScreen = state.roundScreen,
@@ -113,7 +120,10 @@ private fun WatchApp(vm: WatchViewModel = viewModel()) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .swipeBack { latestBack.value?.invoke() }
+                .then(
+                    // 紧凑屏设备由系统接管右滑退出，应用内再挂一层横向手势会互相抢事件
+                    if (compact) Modifier else Modifier.swipeBack { latestBack.value?.invoke() }
+                )
         ) {
             when (state.screen) {
                 Screen.HOME -> HomeScreen(

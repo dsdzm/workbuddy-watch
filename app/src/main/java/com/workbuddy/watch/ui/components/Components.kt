@@ -6,6 +6,8 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -50,7 +52,14 @@ import com.workbuddy.watch.ui.theme.PillShape
 import com.workbuddy.watch.ui.theme.WatchPalette
 
 /** 药丸卡片统一的内边距：横向 16、纵向 12，做出参考图里那种「矮胖胶囊」。 */
-private val PillContentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)
+@Composable
+private fun pillContentPadding(): PaddingValues =
+    if (LocalCompactUi.current) {
+        // 267dp 小屏：横向收窄、纵向加高，单点触控更容易点中
+        PaddingValues(horizontal = 12.dp, vertical = 14.dp)
+    } else {
+        PaddingValues(horizontal = 16.dp, vertical = 12.dp)
+    }
 
 /* ---------------- 外壳 ---------------- */
 
@@ -227,7 +236,7 @@ fun PillRow(
             enabled = enabled,
             shape = PillShape,
             colors = CardDefaults.cardColors(containerColor = container),
-            contentPadding = PillContentPadding
+            contentPadding = pillContentPadding()
         ) { content() }
     } else {
         Box(
@@ -235,7 +244,7 @@ fun PillRow(
                 .fillMaxWidth()
                 .clip(PillShape)
                 .background(container)
-                .padding(PillContentPadding)
+                .padding(pillContentPadding())
         ) { content() }
     }
 }
@@ -253,7 +262,7 @@ fun InfoPill(
             .fillMaxWidth()
             .clip(PillShape)
             .background(container)
-            .padding(PillContentPadding)
+            .padding(pillContentPadding())
     ) {
         androidx.compose.runtime.CompositionLocalProvider(
             androidx.compose.material3.LocalContentColor provides contentColor
@@ -370,7 +379,10 @@ fun PillInput(
         modifier = modifier.fillMaxWidth(),
         shape = PillShape,
         colors = CardDefaults.cardColors(containerColor = WatchPalette.PillDim),
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)
+        contentPadding = PaddingValues(
+            horizontal = if (LocalCompactUi.current) 12.dp else 16.dp,
+            vertical = if (LocalCompactUi.current) 12.dp else 14.dp
+        )
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -425,7 +437,10 @@ fun PillTextField(
                     .fillMaxWidth()
                     .clip(PillShape)
                     .background(WatchPalette.PillDim)
-                    .padding(horizontal = 16.dp, vertical = 14.dp)
+                    .padding(
+                        horizontal = if (LocalCompactUi.current) 12.dp else 16.dp,
+                        vertical = if (LocalCompactUi.current) 12.dp else 14.dp
+                    )
             ) {
                 if (value.isEmpty()) {
                     Text(
@@ -463,25 +478,42 @@ fun StatusTag(text: String, color: Color, modifier: Modifier = Modifier) {
     }
 }
 
-/** 首页快捷场景：一排可横向滚动的小药丸。 */
+/** 首页快捷场景：普通屏横向滚动；紧凑屏改成自动换行，避免横滑和系统右滑冲突。 */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SceneChips(scenes: List<String>, onPick: (String) -> Unit) {
+    if (LocalCompactUi.current) {
+        FlowRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            scenes.forEach { label -> SceneChip(label, onPick) }
+        }
+        return
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        scenes.forEach { label ->
-            Card(
-                onClick = { onPick(label) },
-                shape = PillShape,
-                colors = CardDefaults.cardColors(containerColor = WatchPalette.Pill),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
-            ) {
-                Text(label, style = MaterialTheme.typography.labelMedium, color = WatchPalette.OnPill, maxLines = 1)
-            }
-        }
+        scenes.forEach { label -> SceneChip(label, onPick) }
+    }
+}
+
+@Composable
+private fun SceneChip(label: String, onPick: (String) -> Unit) {
+    Card(
+        onClick = { onPick(label) },
+        shape = PillShape,
+        colors = CardDefaults.cardColors(containerColor = WatchPalette.Pill),
+        contentPadding = PaddingValues(
+            horizontal = if (LocalCompactUi.current) 12.dp else 14.dp,
+            vertical = if (LocalCompactUi.current) 10.dp else 8.dp
+        )
+    ) {
+        Text(label, style = MaterialTheme.typography.labelMedium, color = WatchPalette.OnPill, maxLines = 1)
     }
 }
 
@@ -499,7 +531,10 @@ fun AttachmentChips(attachments: List<Artifact>, onRemove: (String) -> Unit) {
                 modifier = Modifier.fillMaxWidth(),
                 shape = PillShape,
                 colors = CardDefaults.cardColors(containerColor = WatchPalette.Pill),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+                contentPadding = PaddingValues(
+                    horizontal = if (LocalCompactUi.current) 12.dp else 14.dp,
+                    vertical = if (LocalCompactUi.current) 12.dp else 10.dp
+                )
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -558,7 +593,10 @@ fun TaskCard(
         modifier = Modifier.fillMaxWidth(),
         shape = PillShape,
         colors = CardDefaults.cardColors(containerColor = WatchPalette.Pill),
-        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+        contentPadding = PaddingValues(
+            horizontal = if (LocalCompactUi.current) 12.dp else 14.dp,
+            vertical = if (LocalCompactUi.current) 12.dp else 10.dp
+        )
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),

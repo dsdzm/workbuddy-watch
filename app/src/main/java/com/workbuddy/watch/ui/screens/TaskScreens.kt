@@ -33,6 +33,7 @@ import com.workbuddy.watch.ui.components.CenteredHeader
 import com.workbuddy.watch.ui.components.CircleBadge
 import com.workbuddy.watch.ui.components.DangerPillButton
 import com.workbuddy.watch.ui.components.InfoPill
+import com.workbuddy.watch.ui.components.LocalCompactUi
 import com.workbuddy.watch.ui.components.MutedPillButton
 import com.workbuddy.watch.ui.components.PageHeader
 import com.workbuddy.watch.ui.components.PillRow
@@ -396,6 +397,8 @@ fun SettingsScreen(
     onBack: () -> Unit,
     version: String = BuildConfig.VERSION_NAME
 ) {
+    // 紧凑屏是固定方屏硬件，没有「圆屏 / 方屏」可切，隐藏这一项
+    val compact = LocalCompactUi.current
     WatchPage(roundScreen) {
         item { PageHeader("设置", onBack) }
 
@@ -424,15 +427,18 @@ fun SettingsScreen(
             }
         }
 
-        item { SectionLabel("外观") }
-        item {
-            PillRow(
-                title = if (roundScreen) "圆形表盘" else "方形表盘",
-                subtitle = "点此在圆屏 / 方屏之间切换，内容边距随之调整",
-                leadingIcon = Icons.Filled.Refresh,
-                trailing = "切换",
-                onClick = onToggleShape
-            )
+        // 紧凑屏是固定方屏硬件，没有「圆屏 / 方屏」可切，隐藏这一项
+        if (!compact) {
+            item { SectionLabel("外观") }
+            item {
+                PillRow(
+                    title = if (roundScreen) "圆形表盘" else "方形表盘",
+                    subtitle = "点此在圆屏 / 方屏之间切换，内容边距随之调整",
+                    leadingIcon = Icons.Filled.Refresh,
+                    trailing = "切换",
+                    onClick = onToggleShape
+                )
+            }
         }
 
         item { SectionLabel("模型") }

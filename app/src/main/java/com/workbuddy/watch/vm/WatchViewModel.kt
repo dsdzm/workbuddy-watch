@@ -8,6 +8,7 @@ import android.provider.OpenableColumns
 import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.workbuddy.watch.DeviceProfile
 import com.workbuddy.watch.data.Artifact
 import com.workbuddy.watch.data.ChatMessage
 import com.workbuddy.watch.data.ChatRole
@@ -159,6 +160,11 @@ class WatchViewModel(app: Application) : AndroidViewModel(app) {
     private var loginFlow: NativeLogin? = null
 
     init {
+        // 华为儿童手表 4X 是固定方屏：直接落盘为方屏并视为已选择，避免引导页和
+        // 设置里的「切换形状」在这台设备上给出与硬件不符的选项。
+        if (DeviceProfile.isHuaweiWatch4x(getApplication())) {
+            settings.saveScreenShape(round = false)
+        }
         bindRepo()
     }
 

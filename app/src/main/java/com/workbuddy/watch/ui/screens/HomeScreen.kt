@@ -21,6 +21,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
+import androidx.wear.compose.foundation.lazy.ScalingLazyListScope
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.Text
 import com.workbuddy.watch.data.Artifact
@@ -29,10 +30,12 @@ import com.workbuddy.watch.ui.components.AccentPillButton
 import com.workbuddy.watch.ui.components.AttachmentChips
 import com.workbuddy.watch.ui.components.CenteredHeader
 import com.workbuddy.watch.ui.components.InfoPill
+import com.workbuddy.watch.ui.components.LocalCompactUi
 import com.workbuddy.watch.ui.components.PAGER_DOTS_INSET
 import com.workbuddy.watch.ui.components.PillInput
 import com.workbuddy.watch.ui.components.PillRow
 import com.workbuddy.watch.ui.components.SceneChips
+import com.workbuddy.watch.ui.components.SectionLabel
 import com.workbuddy.watch.ui.components.TaskCard
 import com.workbuddy.watch.ui.components.WatchPage
 import com.workbuddy.watch.ui.components.WatchPager
@@ -69,6 +72,42 @@ fun HomeScreen(
     onLogin: () -> Unit,
     onOpenTask: (String) -> Unit
 ) {
+    // 紧凑屏没有左右翻页：系统右滑会直接退出，横向手势要全部让开。
+    // 这里把两页合并成一条纵向长列表，功能不丢，只多点一次滚动。
+    if (LocalCompactUi.current) {
+        WatchPage(roundScreen = false, scrollIndicator = false) {
+            taskItems(
+                connected = connected,
+                cloudError = cloudError,
+                loggedIn = loggedIn,
+                workingTask = workingTask,
+                attachments = attachments,
+                modelLabel = modelLabel,
+                onScene = onScene,
+                onCompose = onCompose,
+                onRemoveAttachment = onRemoveAttachment,
+                onLogin = onLogin,
+                onModels = onModels,
+                onOpenTask = onOpenTask
+            )
+            item { SectionLabel("快捷菜单") }
+            menuItems(
+                loggedIn = loggedIn,
+                accountHint = accountHint,
+                unreadCount = unreadCount,
+                uploading = uploading,
+                onList = onList,
+                onUsage = onUsage,
+                onConn = onConn,
+                onPickFile = onPickFile,
+                onSettings = onSettings,
+                onAbout = onAbout,
+                onLogin = onLogin
+            )
+        }
+        return
+    }
+
     WatchPager(pageCount = 2) { page ->
         if (page == PAGE_TASK) {
             TaskPage(
@@ -123,60 +162,91 @@ private fun TaskPage(
     onOpenTask: (String) -> Unit
 ) {
     WatchPage(roundScreen = roundScreen, scrollIndicator = false, bottomInset = PAGER_DOTS_INSET) {
-        item { CenteredHeader("WorkBuddy", "手腕上的 AI 工作搭子") }
-        // 模型选择：下达任务前就能看到并切换，位置对齐参考图顶部的模型 chip
-        item { ModelChip(modelLabel, onModels) }
+        taskItems(
+            connected = connected,
+            cloudError = cloudError,
+            loggedIn = loggedIn,
+            workingTask = workingTask,
+            attachments = attachments,
+            modelLabel = modelLabel,
+            onScene = onScene,
+            onCompose = onCompose,
+            onRemoveAttachment = onRemoveAttachment,
+            onLogin = onLogin,
+            onModels = onModels,
+            onOpenTask = onOpenTask
+        )
+    }
+}
+
+/** 任务区条目，普通屏和紧凑屏共用。 */
+private fun ScalingLazyListScope.taskItems(
+    connected: Boolean,
+    cloudError: String?,
+    loggedIn: Boolean,
+    workingTask: Task?,
+    attachments: List<Artifact>,
+    modelLabel: String,
+    onScene: (String) -> Unit,
+    onCompose: () -> Unit,
+    onRemoveAttachment: (String) -> Unit,
+    onLogin: () -> Unit,
+    onModels: () -> Unit,
+    onOpenTask: (String) -> Unit
+) {
+    item { CenteredHeader("WorkBuddy", "手腕上的 AI 工作搭子") }
+    // 模型选择：下达任务前就能看到并切换，位置对齐参考图顶部的模型 chip
+    item { ModelChip(modelLabel, onModels) }
+    item {
+        PillInput(
+            hint = "输入任务…",
+            trailingIcon = Icons.Filled.Search,
+            onClick = onCompose
+        )
+    }
+    if (loggedIn && !connected) {
         item {
-            PillInput(
-                hint = "输入任务…",
-                trailingIcon = Icons.Filled.Search,
-                onClick = onCompose
+            InfoPill(
+                container = WatchPalette.ErrorContainer,
+                contentColor = WatchPalette.OnErrorContainer
+            ) {
+                Text("云端未连通，任务暂不能发出" + (cloudError?.let { "：$it" } ?: ""))
+            }
+        }
+    }
+    if (!loggedIn) {
+        item {
+            PillRow(
+                title = "未登录",
+                subtitle = "点此用手机号 + 验证码登录，手表独立直连云端",
+                leadingIcon = Icons.Filled.Person,
+                trailing = "登录",
+                onClick = onLogin
             )
         }
-        if (loggedIn && !connected) {
-            item {
-                InfoPill(
-                    container = WatchPalette.ErrorContainer,
-                    contentColor = WatchPalette.OnErrorContainer
-                ) {
-                    Text("云端未连通，任务暂不能发出" + (cloudError?.let { "：$it" } ?: ""))
-                }
-            }
-        }
-        if (!loggedIn) {
-            item {
-                PillRow(
-                    title = "未登录",
-                    subtitle = "点此用手机号 + 验证码登录，手表独立直连云端",
-                    leadingIcon = Icons.Filled.Person,
-                    trailing = "登录",
-                    onClick = onLogin
-                )
-            }
-        }
-        if (workingTask != null) {
-            item {
-                TaskCard(
-                    title = workingTask.title,
-                    tag = { TaskStatusTag(workingTask.status) },
-                    subText = "${envLabel(workingTask.env)} · ${progressLabel(workingTask)}",
-                    progress = progressOf(workingTask),
-                    unread = workingTask.unread,
-                    onClick = { onOpenTask(workingTask.id) }
-                )
-            }
-        }
-        item { SceneChips(SCENES, onScene) }
-        if (attachments.isNotEmpty()) {
-            item { AttachmentChips(attachments, onRemoveAttachment) }
-        }
+    }
+    if (workingTask != null) {
         item {
-            AccentPillButton(
-                text = "下达任务",
-                icon = Icons.AutoMirrored.Filled.Send,
-                onClick = onCompose
+            TaskCard(
+                title = workingTask.title,
+                tag = { TaskStatusTag(workingTask.status) },
+                subText = "${envLabel(workingTask.env)} · ${progressLabel(workingTask)}",
+                progress = progressOf(workingTask),
+                unread = workingTask.unread,
+                onClick = { onOpenTask(workingTask.id) }
             )
         }
+    }
+    item { SceneChips(SCENES, onScene) }
+    if (attachments.isNotEmpty()) {
+        item { AttachmentChips(attachments, onRemoveAttachment) }
+    }
+    item {
+        AccentPillButton(
+            text = "下达任务",
+            icon = Icons.AutoMirrored.Filled.Send,
+            onClick = onCompose
+        )
     }
 }
 
@@ -198,80 +268,111 @@ private fun MenuPage(
 ) {
     WatchPage(roundScreen = roundScreen, scrollIndicator = false, bottomInset = PAGER_DOTS_INSET) {
         item { CenteredHeader("WorkBuddy") }
-        item {
-            PillRow(
-                title = "历史对话",
-                subtitle = "查看云上会话的完整记录",
-                leadingIcon = Icons.Filled.History,
-                trailing = if (unreadCount > 0) "$unreadCount 条新" else null,
-                onClick = onList
-            )
-        }
-        item {
-            PillRow(
-                title = "积分用量",
-                subtitle = "剩余积分 / 今日调用",
-                leadingIcon = Icons.Filled.Paid,
-                onClick = onUsage
-            )
-        }
-        item {
-            PillRow(
-                title = "执行环境",
-                subtitle = "云端沙箱 / 连接电脑",
-                leadingIcon = Icons.Filled.Cloud,
-                trailing = "切换",
-                onClick = onConn
-            )
-        }
-        item {
-            PillRow(
-                title = "上传附件",
-                subtitle = if (uploading) "上传中…" else "选中后随任务一起下发",
-                leadingIcon = Icons.Filled.AttachFile,
-                onClick = onPickFile
-            )
-        }
-        item {
-            PillRow(
-                title = if (loggedIn) "已登录" else "未登录",
-                subtitle = if (loggedIn) {
-                    accountHint.ifBlank { "手表独立直连云端" }
-                } else {
-                    "点此用手机号 + 验证码登录"
-                },
-                leadingIcon = Icons.Filled.Person,
-                trailing = if (loggedIn) "重新登录" else "登录",
-                onClick = onLogin
-            )
-        }
-        item {
-            PillRow(
-                title = "设置",
-                leadingIcon = Icons.Filled.Settings,
-                onClick = onSettings
-            )
-        }
-        item {
-            PillRow(
-                title = "关于",
-                leadingIcon = Icons.Filled.Info,
-                onClick = onAbout
-            )
-        }
+        menuItems(
+            loggedIn = loggedIn,
+            accountHint = accountHint,
+            unreadCount = unreadCount,
+            uploading = uploading,
+            onList = onList,
+            onUsage = onUsage,
+            onConn = onConn,
+            onPickFile = onPickFile,
+            onSettings = onSettings,
+            onAbout = onAbout,
+            onLogin = onLogin
+        )
+    }
+}
+
+/** 菜单区条目，普通屏和紧凑屏共用（紧凑屏直接接在任务区下面）。 */
+private fun ScalingLazyListScope.menuItems(
+    loggedIn: Boolean,
+    accountHint: String,
+    unreadCount: Int,
+    uploading: Boolean,
+    onList: () -> Unit,
+    onUsage: () -> Unit,
+    onConn: () -> Unit,
+    onPickFile: () -> Unit,
+    onSettings: () -> Unit,
+    onAbout: () -> Unit,
+    onLogin: () -> Unit
+) {
+    item {
+        PillRow(
+            title = "历史对话",
+            subtitle = "查看云上会话的完整记录",
+            leadingIcon = Icons.Filled.History,
+            trailing = if (unreadCount > 0) "$unreadCount 条新" else null,
+            onClick = onList
+        )
+    }
+    item {
+        PillRow(
+            title = "积分用量",
+            subtitle = "剩余积分 / 今日调用",
+            leadingIcon = Icons.Filled.Paid,
+            onClick = onUsage
+        )
+    }
+    item {
+        PillRow(
+            title = "执行环境",
+            subtitle = "云端沙箱 / 连接电脑",
+            leadingIcon = Icons.Filled.Cloud,
+            trailing = "切换",
+            onClick = onConn
+        )
+    }
+    item {
+        PillRow(
+            title = "上传附件",
+            subtitle = if (uploading) "上传中…" else "选中后随任务一起下发",
+            leadingIcon = Icons.Filled.AttachFile,
+            onClick = onPickFile
+        )
+    }
+    item {
+        PillRow(
+            title = if (loggedIn) "已登录" else "未登录",
+            subtitle = if (loggedIn) {
+                accountHint.ifBlank { "手表独立直连云端" }
+            } else {
+                "点此用手机号 + 验证码登录"
+            },
+            leadingIcon = Icons.Filled.Person,
+            trailing = if (loggedIn) "重新登录" else "登录",
+            onClick = onLogin
+        )
+    }
+    item {
+        PillRow(
+            title = "设置",
+            leadingIcon = Icons.Filled.Settings,
+            onClick = onSettings
+        )
+    }
+    item {
+        PillRow(
+            title = "关于",
+            leadingIcon = Icons.Filled.Info,
+            onClick = onAbout
+        )
     }
 }
 
 /** 模型 chip：显示当前模型，点击进入模型选择页。 */
 @Composable
 private fun ModelChip(label: String, onClick: () -> Unit) {
+    // 紧凑屏单点触控：把 chip 加高到接近 36dp，手指更容易点中
+    val vertical = if (LocalCompactUi.current) 10.dp else 6.dp
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
         Box(
             modifier = Modifier
                 .clip(CircleShape)
                 .background(WatchPalette.PillDim)
                 .clickable(onClick = onClick)
-                .padding(horizontal = 14.dp, vertical = 6.dp)
+                .padding(horizontal = 14.dp, vertical = vertical)
         ) {
             Text(
                 text = "模型 · $label",

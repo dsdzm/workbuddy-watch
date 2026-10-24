@@ -17,6 +17,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -31,6 +32,13 @@ import androidx.wear.compose.foundation.pager.rememberPagerState
 import androidx.wear.compose.material3.ScrollIndicator
 import androidx.wear.compose.material3.ScreenScaffold
 import com.workbuddy.watch.ui.theme.WatchPalette
+
+/**
+ * 紧凑屏（华为儿童手表 4X：320×320 @192dpi ≈ 267dp）开关。
+ *
+ * 打开后统一做三件事：方屏布局、缩小边距、去掉所有横向手势。
+ */
+val LocalCompactUi = compositionLocalOf { false }
 
 /**
  * 列表型页面的骨架：`ScreenScaffold` + `ScalingLazyColumn`。
@@ -51,6 +59,35 @@ fun WatchPage(
     content: ScalingLazyListScope.() -> Unit
 ) {
     val listState = rememberScalingLazyListState()
+    val compact = LocalCompactUi.current
+
+    // 紧凑屏不用 ScreenScaffold：它按圆屏给的上下留白会吃掉本就紧张的竖向空间，
+    // 而且内容会被挤到屏幕中间。这里直接从顶部开始排。
+    // 右侧多留 18dp：系统右滑退出的起手区在屏幕边缘，内容不要贴着右边。
+    if (compact) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .safeDrawingPadding()
+        ) {
+            ScalingLazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                state = listState,
+                contentPadding = PaddingValues(
+                    start = 8.dp,
+                    end = 18.dp,
+                    top = 8.dp,
+                    bottom = 10.dp + bottomInset
+                ),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                content()
+            }
+        }
+        return
+    }
+
     ScreenScaffold(
         scrollState = listState,
         scrollIndicator = if (scrollIndicator) {
@@ -108,6 +145,8 @@ fun WatchColumn(
     modifier: Modifier = Modifier,
     content: @Composable ColumnScope.() -> Unit
 ) {
+    val compact = LocalCompactUi.current
+    val effectiveRound = roundScreen && !compact
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -117,11 +156,16 @@ fun WatchColumn(
         Column(
             modifier = modifier
                 .fillMaxHeight()
-                .fillMaxWidth(if (roundScreen) CIRCLE_SAFE_WIDTH else 1f)
+                .fillMaxWidth(if (effectiveRound) CIRCLE_SAFE_WIDTH else 1f)
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = if (roundScreen) 0.dp else 6.dp)
-                .padding(top = 26.dp, bottom = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+                .padding(
+                    start = if (compact) 8.dp else if (effectiveRound) 0.dp else 6.dp,
+                    // 右侧留白同步让开系统右滑退出区
+                    end = if (compact) 18.dp else if (effectiveRound) 0.dp else 6.dp,
+                    top = if (compact) 8.dp else 26.dp,
+                    bottom = 10.dp
+                ),
+            verticalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 8.dp),
             content = content
         )
     }
